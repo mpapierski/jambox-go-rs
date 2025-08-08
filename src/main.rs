@@ -15,7 +15,6 @@ use reqwest::{
     header::{ACCEPT, USER_AGENT},
     Client,
 };
-use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -26,19 +25,6 @@ use std::{
 };
 use tracing::{info, warn};
 use url::Url;
-
-#[derive(Clone, Deserialize, Default, Debug)]
-struct Config {
-    host: String,
-    port: u16,
-    #[serde(default, deserialize_with = "bool_from_any")]
-    threaded: bool,
-    #[serde(default, deserialize_with = "bool_from_any")]
-    hls: bool,
-    #[serde(default, deserialize_with = "bool_from_any")]
-    debug: bool,
-}
-
 #[derive(Clone, Deserialize, Serialize, Debug)]
 struct Channel {
     name: String,
@@ -68,11 +54,11 @@ struct Cli {
     #[arg(long, env = "JAMBOX_PORT", default_value_t = 8098)]
     port: u16,
     /// Username for API login (env: JAMBOX_USERNAME)
-    #[arg(long, env = "JAMBOX_USERNAME", default_value_t = String::new())]
-    username: String,
+    #[arg(long, env = "JAMBOX_USERNAME")]
+    username: Option<String>,
     /// Password for API login (env: JAMBOX_PASSWORD)
-    #[arg(long, env = "JAMBOX_PASSWORD", default_value_t = String::new())]
-    password: String,
+    #[arg(long, env = "JAMBOX_PASSWORD")]
+    password: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -100,13 +86,6 @@ async fn main() -> Result<()> {
         .init();
 
     // Load files similar to Python main.py, from current or parent dir
-    let mut config: Config = read_json("config.json").unwrap_or_else(|_| Config {
-        host: "0.0.0.0".into(),
-        port: 6666,
-        threaded: false,
-        hls: true,
-        debug: false,
-    });
     // Ensure cookie.json exists (login using CLI/env credentials if needed)
     let mut cookies: Cookies = read_json("cookie.json").unwrap_or_default();
     if cookies.id.is_empty()
@@ -117,17 +96,21 @@ async fn main() -> Result<()> {
             .map(|d| d.id.is_empty())
             .unwrap_or(true)
     {
-        if !cli.username.is_empty() && !cli.password.is_empty() {
-            let creds = Credentials {
-                username: cli.username.clone(),
-                password: cli.password.clone(),
-            };
-            match login_and_write_cookies(&creds).await {
-                Ok(new_cookies) => {
-                    cookies = new_cookies;
-                    info!("cookie.json created via login");
+        if let (Some(u), Some(p)) = (cli.username.as_deref(), cli.password.as_deref()) {
+            if !u.is_empty() && !p.is_empty() {
+                let creds = Credentials {
+                    username: u.to_owned(),
+                    password: p.to_owned(),
+                };
+                match login_and_write_cookies(&creds).await {
+                    Ok(new_cookies) => {
+                        cookies = new_cookies;
+                        info!("cookie.json created via login");
+                    }
+                    Err(e) => warn!("login failed: {}", e),
                 }
-                Err(e) => warn!("login failed: {}", e),
+            } else {
+                warn!("credentials provided but empty; skipping login");
             }
         } else {
             warn!("no credentials provided via CLI/env; skipping login");
@@ -138,16 +121,6 @@ async fn main() -> Result<()> {
         warn!("channels generation failed: {}", e);
     }
     let channels: Vec<Channel> = read_json("channels.list").unwrap_or_else(|_| Vec::new());
-
-    // Apply CLI/env values for host/port (CLI defaults apply when not set)
-    config.host = cli.host;
-    config.port = cli.port;
-
-    // Read config fields to avoid dead_code lints and provide visibility at startup
-    info!(
-        "Config: threaded={}, hls={}, debug={}",
-        config.threaded, config.hls, config.debug
-    );
 
     let user_hash = urlencoding::encode(&cookies.id.replace('\\', "")).into_owned();
     let state = AppState {
@@ -165,13 +138,13 @@ async fn main() -> Result<()> {
         .route("/*tail", get(get_channel))
         .with_state(state);
 
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = format!("{}:{}", cli.host, cli.port);
     info!(%addr, "Starting server");
     let listener = match tokio::net::TcpListener::bind(addr.clone()).await {
         Ok(l) => l,
         Err(e) => {
             warn!("Bind {} failed ({}), falling back to 0.0.0.0", addr, e);
-            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?
+            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", cli.port)).await?
         }
     };
     axum::serve(listener, app).await?;
@@ -588,52 +561,4 @@ async fn login_and_write_cookies(creds: &Credentials) -> Result<Cookies> {
     // Parse minimal fields into Cookies for use in code
     let cookies: Cookies = serde_json::from_value(v)?;
     Ok(cookies)
-}
-
-// Accept 0/1, true/false, and strings "0"/"1"/"true"/"false" for booleans
-fn bool_from_any<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct BoolVisitor;
-    impl<'de> serde::de::Visitor<'de> for BoolVisitor {
-        type Value = bool;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            write!(f, "a bool, 0/1, or \"true\"/\"false\" string")
-        }
-        fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
-            Ok(v)
-        }
-        fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(v != 0)
-        }
-        fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(v != 0)
-        }
-        fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            if v == "1" || v.eq_ignore_ascii_case("true") {
-                Ok(true)
-            } else if v == "0" || v.eq_ignore_ascii_case("false") {
-                Ok(false)
-            } else {
-                Err(E::custom(format!("invalid bool value: {v}")))
-            }
-        }
-        fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&v)
-        }
-    }
-    deserializer.deserialize_any(BoolVisitor)
 }
