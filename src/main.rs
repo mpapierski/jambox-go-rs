@@ -7,6 +7,7 @@ use axum::{
     Router,
 };
 use base64::Engine as _;
+use clap::Parser;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use regex::Regex;
@@ -57,7 +58,24 @@ struct Device {
     id: String,
 }
 
-#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Jambox GO proxy", long_about = None)]
+struct Cli {
+    /// Server host to bind (env: JAMBOX_HOST)
+    #[arg(long, env = "JAMBOX_HOST", default_value_t = String::from("0.0.0.0"))]
+    host: String,
+    /// Server port to bind (env: JAMBOX_PORT)
+    #[arg(long, env = "JAMBOX_PORT", default_value_t = 8098)]
+    port: u16,
+    /// Username for API login (env: JAMBOX_USERNAME)
+    #[arg(long, env = "JAMBOX_USERNAME", default_value_t = String::new())]
+    username: String,
+    /// Password for API login (env: JAMBOX_PASSWORD)
+    #[arg(long, env = "JAMBOX_PASSWORD", default_value_t = String::new())]
+    password: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct Credentials {
     username: String,
     password: String,
@@ -74,6 +92,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -88,7 +107,7 @@ async fn main() -> Result<()> {
         hls: true,
         debug: false,
     });
-    // Ensure cookie.json exists (login using credentials.json if needed)
+    // Ensure cookie.json exists (login using CLI/env credentials if needed)
     let mut cookies: Cookies = read_json("cookie.json").unwrap_or_default();
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
@@ -98,14 +117,11 @@ async fn main() -> Result<()> {
             .map(|d| d.id.is_empty())
             .unwrap_or(true)
     {
-        let creds: Credentials = match read_json("credentials.json") {
-            Ok(c) => c,
-            Err(_) => {
-                warn!("credentials.json missing; cannot login to create cookie.json");
-                Credentials::default()
-            }
-        };
-        if !creds.username.is_empty() && !creds.password.is_empty() {
+        if !cli.username.is_empty() && !cli.password.is_empty() {
+            let creds = Credentials {
+                username: cli.username.clone(),
+                password: cli.password.clone(),
+            };
             match login_and_write_cookies(&creds).await {
                 Ok(new_cookies) => {
                     cookies = new_cookies;
@@ -114,7 +130,7 @@ async fn main() -> Result<()> {
                 Err(e) => warn!("login failed: {}", e),
             }
         } else {
-            warn!("credentials.json lacks username/password; skipping login");
+            warn!("no credentials provided via CLI/env; skipping login");
         }
     }
     // Ensure channels.list exists by generating from API if missing/empty
@@ -123,12 +139,9 @@ async fn main() -> Result<()> {
     }
     let channels: Vec<Channel> = read_json("channels.list").unwrap_or_else(|_| Vec::new());
 
-    if config.host.is_empty() {
-        config.host = "0.0.0.0".into();
-    }
-    if config.port == 0 {
-        config.port = 6666;
-    }
+    // Apply CLI/env values for host/port (CLI defaults apply when not set)
+    config.host = cli.host;
+    config.port = cli.port;
 
     // Read config fields to avoid dead_code lints and provide visibility at startup
     info!(

@@ -26,3 +26,4 @@ http = "1"
 headers = "0.4"
 urlencoding = "2"
 hex = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
