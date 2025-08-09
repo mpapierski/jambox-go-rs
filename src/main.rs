@@ -17,6 +17,8 @@ use reqwest::{
 };
 use serde::{Deserialize, Serialize};
 mod assets;
+mod db;
+mod schema;
 use assets::{AssetUrlField, Assets};
 use std::{
     collections::HashSet,
@@ -45,16 +47,6 @@ struct Cookies {
     devices: Vec<Device>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct Channel {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    sgtid: u32,
-}
-
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Jambox GO proxy", long_about = None)]
 struct Cli {
@@ -81,10 +73,12 @@ struct Credentials {
 #[derive(Clone)]
 struct AppState {
     client: Client,
-    channels: Arc<Vec<Channel>>,
     cookies: Arc<Cookies>,
     token: Arc<RwLock<String>>, // refreshed on 403
     user_hash: Arc<String>,     // pre-encoded user id
+    db_pool: db::SqlitePool,
+    host: Arc<str>,
+    port: u16,
 }
 
 #[tokio::main]
@@ -98,7 +92,13 @@ async fn main() -> Result<()> {
 
     // Load files similar to Python main.py, from current or parent dir
     // Ensure cookie.json exists (login using CLI/env credentials if needed)
-    let mut cookies: Cookies = read_json("cookie.json").unwrap_or_default();
+    let mut cookies: Cookies = {
+        if let Ok(s) = read_string("cookie.json") {
+            serde_json::from_str(&s).unwrap_or_default()
+        } else {
+            Cookies::default()
+        }
+    };
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
         || cookies
@@ -128,19 +128,27 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Ensure channels.list exists by generating from API if missing/empty
-    if let Err(e) = ensure_channels_list(&cookies).await {
-        warn!("channels generation failed: {}", e);
+    // Init sqlite (file jambox.db) and load channels from DB; if empty generate from assets
+    let db_pool = db::init_pool("jambox.db")?;
+    let mut conn = db_pool.get()?;
+    if db::load_channels(&mut conn)?.is_empty() {
+        if let Err(e) = ensure_channels_db(&cookies, &mut conn).await {
+            warn!("channel load failed: {}", e);
+        }
     }
-    let channels: Vec<Channel> = read_json("channels.list").unwrap_or_else(|_| Vec::new());
 
     let user_hash = urlencoding::encode(&cookies.id.replace('\\', "")).into_owned();
+
+    let addr = format!("{}:{}", cli.host, cli.port);
+
     let state = AppState {
         client: Client::builder().gzip(true).deflate(true).build()?,
-        channels: Arc::new(channels),
         cookies: Arc::new(cookies),
         token: Arc::new(RwLock::new(String::new())),
         user_hash: Arc::new(user_hash),
+        db_pool,
+        host: cli.host.into(),
+        port: cli.port,
     };
 
     let app = Router::new()
@@ -150,7 +158,6 @@ async fn main() -> Result<()> {
         .route("/*tail", get(get_channel))
         .with_state(state);
 
-    let addr = format!("{}:{}", cli.host, cli.port);
     info!(%addr, "Starting server");
     let listener = match tokio::net::TcpListener::bind(addr.clone()).await {
         Ok(l) => l,
@@ -164,22 +171,28 @@ async fn main() -> Result<()> {
 }
 
 async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
-    if state.channels.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "channels.list missing or empty",
-        )
-            .into_response();
+    let mut conn = match state.db_pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
+    };
+    let rows = match db::load_channels(&mut conn) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB query error").into_response(),
+    };
+    if rows.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "channels DB empty").into_response();
     }
     let mut out = String::new();
     out.push_str("#EXTM3U\n");
-    for (idx, ch) in state.channels.iter().enumerate() {
-        // Minimal tags; tvg-id uses sgtid, logo served locally
+    for (idx, ch) in rows.iter().enumerate() {
         out.push_str(&format!(
             "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"/tvg-logo/{}\",{}\n",
             ch.sgtid, ch.name, idx, ch.name
         ));
-        out.push_str(&format!("/{idx}.m3u8\n"));
+        out.push_str(&format!(
+            "http://{}:{}/{idx}.m3u8\n",
+            state.host, state.port
+        ));
     }
     (
         StatusCode::OK,
@@ -209,7 +222,12 @@ async fn get_tvg_logo(
     State(state): State<AppState>,
     PathParam(id): PathParam<usize>,
 ) -> impl IntoResponse {
-    if let Some(ch) = state.channels.get(id) {
+    let mut conn = match state.db_pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
+    };
+    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    if let Some(ch) = row.as_ref() {
         let url = format!("https://static.sgtsa.pl/channels/logos/{}.png", ch.sgtid);
         match state.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -228,18 +246,16 @@ async fn get_channel(
     State(state): State<AppState>,
     PathParam(tail): PathParam<String>,
 ) -> impl IntoResponse {
-    if state.channels.is_empty() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "channels.list missing or empty",
-        )
-            .into_response();
-    }
     let id_str = tail.strip_suffix(".m3u8").unwrap_or(&tail);
     let Ok(id) = id_str.parse::<usize>() else {
         return (StatusCode::NOT_FOUND, "Invalid id").into_response();
     };
-    let Some(ch) = state.channels.get(id) else {
+    let mut conn = match state.db_pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
+    };
+    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    let Some(ch) = row else {
         return (StatusCode::NOT_FOUND, "Channel not found").into_response();
     };
 
@@ -433,37 +449,7 @@ fn read_string(name: &str) -> std::io::Result<String> {
     }
 }
 
-fn read_json<T: for<'de> serde::Deserialize<'de>>(name: &str) -> Result<T> {
-    let s = read_string(name)?;
-    Ok(serde_json::from_str(&s)?)
-}
-
-fn data_root() -> PathBuf {
-    if let Some(p) = resolve_path("config.json") {
-        return p
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf();
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
-fn write_json<T: serde::Serialize>(name: &str, value: &T) -> Result<()> {
-    let dir = data_root();
-    let path = dir.join(name);
-    let text = serde_json::to_string_pretty(value)?;
-    fs::write(path, text)?;
-    Ok(())
-}
-
-async fn ensure_channels_list(cookies: &Cookies) -> Result<()> {
-    // If channels.list exists and has entries, do nothing
-    if let Ok(existing) = read_json::<Vec<Channel>>("channels.list") {
-        if !existing.is_empty() {
-            return Ok(());
-        }
-    }
-    // Need cookies to auth; if missing, write empty file so it exists
+async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnection) -> Result<()> {
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
         || cookies
@@ -472,40 +458,37 @@ async fn ensure_channels_list(cookies: &Cookies) -> Result<()> {
             .map(|d| d.id.is_empty())
             .unwrap_or(true)
     {
-        warn!("cookie.json missing id/seed/device.id; writing empty channels.list");
-        write_json("channels.list", &Vec::<Channel>::new())?;
+        warn!("cookie.json missing id/seed/device.id; skipping channel generation");
         return Ok(());
     }
     let assets = fetch_assets(cookies).await?;
-    let mut out: Vec<Channel> = Vec::new();
+    let mut rows: Vec<db::NewChannel> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     for item in assets.0.iter() {
         let name = item.name.as_str();
         let sgtid = item.sgtid;
-        if name.is_empty() || sgtid == 0 {
+        if name.is_empty() || sgtid == 0 || seen.contains(&sgtid) {
             continue;
         }
-        if seen.contains(&sgtid) {
-            continue;
-        }
-        let url = match item.url.as_ref() {
-            Some(AssetUrlField::Map {
-                hls_ac3: _,
-                hls_aac,
-            }) => Some(hls_aac.clone()),
-            _ => None,
-        };
-        if let Some(url) = url {
-            out.push(Channel {
-                name: name.to_string(),
-                url,
-                sgtid,
-            });
-            seen.insert(sgtid);
+        if let Some(AssetUrlField::Map {
+            hls_ac3: _,
+            hls_aac,
+        }) = item.url.as_ref()
+        {
+            if !hls_aac.is_empty() {
+                rows.push(db::NewChannel {
+                    sgtid: sgtid as i32,
+                    name,
+                    url: hls_aac,
+                });
+                seen.insert(sgtid);
+            }
         }
     }
-    write_json("channels.list", &out)?;
-    info!("Generated channels.list with {} entries", out.len());
+    if !rows.is_empty() {
+        db::upsert_channels(conn, &rows)?;
+        info!(count = rows.len(), "Inserted/updated channels in DB");
+    }
     Ok(())
 }
 
@@ -592,7 +575,14 @@ async fn login_and_write_cookies(creds: &Credentials) -> Result<Cookies> {
     let text = resp.text().await?;
     // Write the raw JSON to cookie.json like Python does
     let v: serde_json::Value = serde_json::from_str(&text)?;
-    write_json("cookie.json", &v)?;
+    if let Ok(text) = serde_json::to_string_pretty(&v) {
+        if let Some(dir) = std::path::Path::new("cookie.json").parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write("cookie.json", text) {
+            warn!("failed to write cookie.json: {}", e);
+        }
+    }
     // Parse minimal fields into Cookies for use in code
     let cookies: Cookies = serde_json::from_value(v)?;
     Ok(cookies)

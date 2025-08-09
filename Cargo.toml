@@ -27,3 +27,6 @@ headers = "0.4"
 urlencoding = "2"
 hex = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+diesel = { version = "2", features = ["sqlite", "r2d2", "chrono"] }
+diesel_migrations = { version = "2", features = ["sqlite"] }
+r2d2 = "0.8"
