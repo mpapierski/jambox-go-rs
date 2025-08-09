@@ -8,6 +8,7 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
+use http::HeaderValue;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use regex::Regex;
@@ -25,7 +26,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
 use url::Url;
@@ -314,6 +315,8 @@ async fn get_channel(
     info!(channel = %ch.name, "Channel request");
 
     let mut my_url = ch.url.clone();
+    // let mut my_url = my_url.replace("sgtsa.pl","sgt.net.pl");
+
     // Log selected quality bitrate if known
     if let Some(info) = state.qualities.get(state.quality.as_ref()) {
         info!(selected_quality = %state.quality, bitrate = info.bitrate, label = %info.label, "Serving channel with quality");
@@ -343,8 +346,16 @@ async fn get_channel(
 
         let url = reqwest::Url::parse_with_params(&my_url, &params).expect("valid URL with params");
 
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) Gecko/20100101 Firefox/141.0"));
+        headers.insert("Accept", HeaderValue::from_static("*/*"));
+        headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate, br, zstd"));
+        headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+        headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
+        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
+
         info!(url = %url, "Fetching channel content");
-        match state.client.get(url).send().await {
+        match state.client.get(url).headers(headers).timeout(Duration::from_secs(10)).send().await {
             Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
                 warn!("Resource not found...");
                 Err(backoff::Error::Permanent(anyhow!("Resource not found")))
@@ -417,7 +428,7 @@ async fn get_channel(
                 )))
             }
             Err(e) => {
-                warn!("Fetch failed: {}", e);
+                warn!(is_timeout=e.is_timeout(), "Fetch failed: {}", e);
                 Err(backoff::Error::permanent(anyhow!(e)))
             }
         }
