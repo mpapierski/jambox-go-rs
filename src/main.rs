@@ -31,6 +31,18 @@ use tracing::{info, warn};
 use url::Url;
 // asset schema moved to assets.rs
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct QualityInfo {
+    #[serde(default)]
+    bitrate: u64,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    order: i32,
+}
+
+type Qualities = std::collections::HashMap<String, QualityInfo>;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Device {
     #[serde(default)]
@@ -85,6 +97,7 @@ struct AppState {
     host: Arc<str>,
     port: u16,
     quality: Arc<str>,
+    qualities: Arc<Qualities>,
 }
 
 #[tokio::main]
@@ -146,6 +159,29 @@ async fn main() -> Result<()> {
 
     let addr = format!("{}:{}", cli.host, cli.port);
 
+    // Fetch available qualities (non-fatal on failure, but we use for validation)
+    let qualities = match fetch_qualities(&cookies).await {
+        Ok(q) => q,
+        Err(e) => {
+            warn!(error=%e, "Failed to fetch qualities; proceeding without validation");
+            Qualities::new()
+        }
+    };
+    if !qualities.is_empty() && !qualities.contains_key(cli.quality.as_str()) {
+        let mut available: Vec<&str> = qualities.keys().map(|s| s.as_str()).collect();
+        available.sort();
+        bail!(
+            "Invalid quality '{}'. Available: {}",
+            cli.quality,
+            available.join(", ")
+        );
+    }
+    if !qualities.is_empty() {
+        let mut names: Vec<&str> = qualities.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        info!(count = names.len(), keys = %names.join(","), "Fetched qualities");
+    }
+
     let state = AppState {
         client: Client::builder().gzip(true).deflate(true).build()?,
         cookies: Arc::new(cookies),
@@ -154,6 +190,7 @@ async fn main() -> Result<()> {
         host: cli.host.into(),
         port: cli.port,
         quality: cli.quality.into(),
+        qualities: Arc::new(qualities),
     };
 
     match refresh_token(&state).await {
@@ -277,6 +314,10 @@ async fn get_channel(
     info!(channel = %ch.name, "Channel request");
 
     let mut my_url = ch.url.clone();
+    // Log selected quality bitrate if known
+    if let Some(info) = state.qualities.get(state.quality.as_ref()) {
+        info!(selected_quality = %state.quality, bitrate = info.bitrate, label = %info.label, "Serving channel with quality");
+    }
     if let Some(idx) = my_url.find("playlist.m3u8") {
         // Insert configured quality segment before playlist.m3u8
         my_url = format!("{}{}/{}", &my_url[..idx], &*state.quality, &my_url[idx..]);
@@ -562,6 +603,21 @@ async fn fetch_assets(cookies: &Cookies) -> Result<Assets> {
     }
     let txt = resp.text().await?;
     let v: Assets = serde_json::from_str(&txt)?;
+    Ok(v)
+}
+
+async fn fetch_qualities(cookies: &Cookies) -> Result<Qualities> {
+    let client = Client::builder().gzip(true).deflate(true).build()?;
+    let endpoint = "v1/ott/quality";
+    let (nonce, x_auth) = sign(cookies, endpoint)?;
+    let resp = api_get_builder(&client, cookies, endpoint, &nonce, &x_auth)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("qualities fetch failed: {}", resp.status());
+    }
+    let txt = resp.text().await?;
+    let v: Qualities = serde_json::from_str(&txt)?;
     Ok(v)
 }
 
