@@ -28,6 +28,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use url::Url;
 // asset schema moved to assets.rs
@@ -204,12 +205,18 @@ async fn main() -> Result<()> {
             bail!("Token refresh failed");
         }
     }
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
         .route("/epg", get(get_epg))
         .route("/tvg-logo/:id", get(get_tvg_logo))
         .route("/*tail", get(get_channel))
-        .with_state(state);
+        .with_state(state)
+        .layer(cors);
 
     info!(%addr, "Starting server");
     let listener = match tokio::net::TcpListener::bind(addr.clone()).await {
