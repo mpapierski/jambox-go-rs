@@ -23,7 +23,7 @@ use assets::{AssetUrlField, Assets};
 use std::{
     collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -62,6 +62,9 @@ struct Cli {
     /// Password for API login (env: JAMBOX_PASSWORD)
     #[arg(long, env = "JAMBOX_PASSWORD")]
     password: Option<String>,
+    /// Data directory for cookie.json and jambox.db (env: JAMBOX_DATA_DIR)
+    #[arg(long, env = "JAMBOX_DATA_DIR", default_value = ".")]
+    data_dir: PathBuf,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -90,14 +93,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Load files similar to Python main.py, from current or parent dir
-    // Ensure cookie.json exists (login using CLI/env credentials if needed)
-    let mut cookies: Cookies = {
-        if let Ok(s) = read_string("cookie.json") {
-            serde_json::from_str(&s).unwrap_or_default()
-        } else {
-            Cookies::default()
-        }
+    // Resolve data directory
+    if let Err(e) = fs::create_dir_all(&cli.data_dir) {
+        warn!("failed to create data dir {:?}: {}", cli.data_dir, e);
+    }
+    let cookie_path = cli.data_dir.join("cookie.json");
+    let mut cookies: Cookies = match fs::read_to_string(&cookie_path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Cookies::default(),
     };
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
@@ -113,7 +116,7 @@ async fn main() -> Result<()> {
                     username: u.to_owned(),
                     password: p.to_owned(),
                 };
-                match login_and_write_cookies(&creds).await {
+                match login_and_write_cookies(&creds, &cookie_path).await {
                     Ok(new_cookies) => {
                         cookies = new_cookies;
                         info!("cookie.json created via login");
@@ -129,7 +132,8 @@ async fn main() -> Result<()> {
     }
 
     // Init sqlite (file jambox.db) and load channels from DB; if empty generate from assets
-    let db_pool = db::init_pool("jambox.db")?;
+    let db_path = cli.data_dir.join("jambox.db");
+    let db_pool = db::init_pool(db_path.to_string_lossy().as_ref())?;
     let mut conn = db_pool.get()?;
     if db::load_channels(&mut conn)?.is_empty() {
         if let Err(e) = ensure_channels_db(&cookies, &mut conn).await {
@@ -441,14 +445,6 @@ fn read_bytes(name: &str) -> std::io::Result<Vec<u8>> {
     }
 }
 
-fn read_string(name: &str) -> std::io::Result<String> {
-    if let Some(p) = resolve_path(name) {
-        fs::read_to_string(p)
-    } else {
-        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-    }
-}
-
 async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnection) -> Result<()> {
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
@@ -559,7 +555,7 @@ fn sign(cookies: &Cookies, endpoint: &str) -> Result<(String, String)> {
     Ok((nonce, x_auth))
 }
 
-async fn login_and_write_cookies(creds: &Credentials) -> Result<Cookies> {
+async fn login_and_write_cookies(creds: &Credentials, cookie_path: &Path) -> Result<Cookies> {
     let client = Client::builder().gzip(true).deflate(true).build()?;
     let url = "https://api.sgtsa.pl/v1/auth/login";
     let resp = client
@@ -576,10 +572,10 @@ async fn login_and_write_cookies(creds: &Credentials) -> Result<Cookies> {
     // Write the raw JSON to cookie.json like Python does
     let v: serde_json::Value = serde_json::from_str(&text)?;
     if let Ok(text) = serde_json::to_string_pretty(&v) {
-        if let Some(dir) = std::path::Path::new("cookie.json").parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Some(dir) = cookie_path.parent() {
+            let _ = fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write("cookie.json", text) {
+        if let Err(e) = fs::write(cookie_path, text) {
             warn!("failed to write cookie.json: {}", e);
         }
     }
