@@ -191,7 +191,7 @@ async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
     for (idx, ch) in rows.iter().enumerate() {
         out.push_str(&format!(
             "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"/tvg-logo/{}\",{}\n",
-            ch.sgtid, ch.name, idx, ch.name
+            idx, ch.name, idx, ch.name
         ));
         out.push_str(&format!(
             "http://{}:{}/{idx}.m3u8\n",
