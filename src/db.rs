@@ -50,16 +50,14 @@ pub fn upsert_channels(conn: &mut SqliteConnection, channels: &[NewChannel]) -> 
 
 pub fn load_channels(conn: &mut SqliteConnection) -> Result<Vec<ChannelRow>> {
     use crate::schema::channels::dsl as ch;
-    let rows = ch::channels
-        .order(ch::sgtid.asc())
-        .load::<ChannelRow>(conn)?;
+    let rows = ch::channels.order(ch::id.asc()).load::<ChannelRow>(conn)?;
     Ok(rows)
 }
 
 pub fn channel_at(conn: &mut SqliteConnection, index: usize) -> Result<Option<ChannelRow>> {
     use crate::schema::channels::dsl as ch;
     let mut rows = ch::channels
-        .order(ch::sgtid.asc())
+        .order(ch::id.asc())
         .offset(index as i64)
         .limit(1)
         .load::<ChannelRow>(conn)?;
