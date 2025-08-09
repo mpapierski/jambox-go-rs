@@ -60,3 +60,23 @@ pub struct Asset {
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Assets(pub Vec<Asset>);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_assets() {
+        let json = r#"[{"sgtid":275,"epg_mapping_id":164,"name":"TVP1 HD","category":"Ogólne","category_start":false,"number":1,"entitled":true,"a_logo":null,"a_cu_max_time":"604800","default_number":"1","name_encoded":"TVP1+HD","alternate_id":{"dune_id":249},"constraints_out_of_home":{"live":false,"cu":true,"so":false,"npvr":false,"navigable_services":["all"],"cast":false},"constraints_at_home":{"live":false,"cu":true,"so":false,"npvr":false,"navigable_services":["all"],"cast":false},"url":{"hlsAc3":"https://ch-249.sgtsa.pl/hls_scr/playlist.m3u8","hlsAac":"https://ch-249.sgtsa.pl/hls_scr/playlist.m3u8"}}]"#;
+        let assets: Assets = serde_json::from_str(json).unwrap();
+        assert_eq!(assets.0.len(), 1);
+        let a = &assets.0[0];
+        match a.url.as_ref().unwrap() {
+            AssetUrlField::Map { hls_ac3, hls_aac } => {
+                assert_eq!(hls_ac3, "https://ch-249.sgtsa.pl/hls_scr/playlist.m3u8");
+                assert_eq!(hls_aac, "https://ch-249.sgtsa.pl/hls_scr/playlist.m3u8");
+            }
+            _ => panic!("expected map variant"),
+        }
+    }
+}
