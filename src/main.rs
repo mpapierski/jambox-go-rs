@@ -16,6 +16,8 @@ use reqwest::{
     Client,
 };
 use serde::{Deserialize, Serialize};
+mod assets;
+use assets::{AssetUrlField, Assets};
 use std::{
     collections::HashSet,
     fs,
@@ -25,23 +27,32 @@ use std::{
 };
 use tracing::{info, warn};
 use url::Url;
-#[derive(Clone, Deserialize, Serialize, Debug)]
-struct Channel {
-    name: String,
-    url: String,
-    sgtid: u32,
+// asset schema moved to assets.rs
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Device {
+    #[serde(default)]
+    id: String,
 }
 
-#[derive(Clone, Deserialize, Default, Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct Cookies {
+    #[serde(default)]
     id: String,
+    #[serde(default)]
     seed: String,
+    #[serde(default)]
     devices: Vec<Device>,
 }
 
-#[derive(Clone, Deserialize, Default, Debug)]
-struct Device {
-    id: String,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Channel {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    sgtid: u32,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -116,6 +127,7 @@ async fn main() -> Result<()> {
             warn!("no credentials provided via CLI/env; skipping login");
         }
     }
+
     // Ensure channels.list exists by generating from API if missing/empty
     if let Err(e) = ensure_channels_list(&cookies).await {
         warn!("channels generation failed: {}", e);
@@ -151,16 +163,39 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_playlist() -> impl IntoResponse {
-    match read_bytes("playlist.m3u") {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("Content-Type", "application/vnd.apple.mpegurl")],
-            bytes,
+async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
+    if state.channels.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "channels.list missing or empty",
         )
-            .into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "playlist.m3u not found").into_response(),
+            .into_response();
     }
+    let mut out = String::new();
+    out.push_str("#EXTM3U\n");
+    for (idx, ch) in state.channels.iter().enumerate() {
+        // Minimal tags; tvg-id uses sgtid, logo served locally
+        out.push_str(&format!(
+            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"/tvg-logo/{}\",{}\n",
+            ch.sgtid, ch.name, idx, ch.name
+        ));
+        out.push_str(&format!("/{idx}.m3u8\n"));
+    }
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_static("attachment; filename=playlist.m3u8"),
+            ),
+        ],
+        out,
+    )
+        .into_response()
 }
 
 async fn get_epg() -> impl IntoResponse {
@@ -444,29 +479,29 @@ async fn ensure_channels_list(cookies: &Cookies) -> Result<()> {
     let assets = fetch_assets(cookies).await?;
     let mut out: Vec<Channel> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
-    if let Some(list) = assets.as_array() {
-        for item in list {
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let sgtid = item.get("sgtid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            if name.is_empty() || sgtid == 0 {
-                continue;
-            }
-            if seen.contains(&sgtid) {
-                continue;
-            }
-            let url = item
-                .get("url")
-                .and_then(|u| u.get("hlsAac"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(url) = url {
-                out.push(Channel {
-                    name: name.to_string(),
-                    url,
-                    sgtid,
-                });
-                seen.insert(sgtid);
-            }
+    for item in assets.0.iter() {
+        let name = item.name.as_str();
+        let sgtid = item.sgtid;
+        if name.is_empty() || sgtid == 0 {
+            continue;
+        }
+        if seen.contains(&sgtid) {
+            continue;
+        }
+        let url = match item.url.as_ref() {
+            Some(AssetUrlField::Map {
+                hls_ac3: _,
+                hls_aac,
+            }) => Some(hls_aac.clone()),
+            _ => None,
+        };
+        if let Some(url) = url {
+            out.push(Channel {
+                name: name.to_string(),
+                url,
+                sgtid,
+            });
+            seen.insert(sgtid);
         }
     }
     write_json("channels.list", &out)?;
@@ -474,7 +509,7 @@ async fn ensure_channels_list(cookies: &Cookies) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_assets(cookies: &Cookies) -> Result<serde_json::Value> {
+async fn fetch_assets(cookies: &Cookies) -> Result<Assets> {
     let client = Client::builder().gzip(true).deflate(true).build()?;
     let endpoint = "v1/asset";
     let (nonce, x_auth) = sign(cookies, endpoint)?;
@@ -485,7 +520,7 @@ async fn fetch_assets(cookies: &Cookies) -> Result<serde_json::Value> {
         anyhow::bail!("assets fetch failed: {}", resp.status());
     }
     let txt = resp.text().await?;
-    let v: serde_json::Value = serde_json::from_str(&txt)?;
+    let v: Assets = serde_json::from_str(&txt)?;
     Ok(v)
 }
 
