@@ -30,3 +30,4 @@ clap = { version = "4", features = ["derive", "env"] }
 diesel = { version = "2", features = ["sqlite", "r2d2", "chrono"] }
 diesel_migrations = { version = "2", features = ["sqlite"] }
 r2d2 = "0.8"
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }

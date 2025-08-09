@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use axum::{
     extract::{Path as PathParam, State},
     http::StatusCode,
@@ -25,7 +25,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
 use url::Url;
@@ -78,7 +78,6 @@ struct AppState {
     client: Client,
     cookies: Arc<Cookies>,
     token: Arc<RwLock<String>>, // refreshed on 403
-    user_hash: Arc<String>,     // pre-encoded user id
     db_pool: db::SqlitePool,
     host: Arc<str>,
     port: u16,
@@ -141,20 +140,27 @@ async fn main() -> Result<()> {
         }
     }
 
-    let user_hash = urlencoding::encode(&cookies.id.replace('\\', "")).into_owned();
-
     let addr = format!("{}:{}", cli.host, cli.port);
 
     let state = AppState {
         client: Client::builder().gzip(true).deflate(true).build()?,
         cookies: Arc::new(cookies),
         token: Arc::new(RwLock::new(String::new())),
-        user_hash: Arc::new(user_hash),
         db_pool,
         host: cli.host.into(),
         port: cli.port,
     };
 
+    match refresh_token(&state).await {
+        Ok(t) => {
+            info!(new_token = %t, "Token refreshed successfully");
+            *state.token.write() = t;
+        }
+        Err(e) => {
+            warn!("Failed to refresh token: {}", e);
+            bail!("Token refresh failed");
+        }
+    }
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
         .route("/epg", get(get_epg))
@@ -273,7 +279,6 @@ async fn get_channel(
     let parsed = Url::parse(&my_url).ok();
     info!(request_url = %my_url, "Request url");
 
-    let mut attempt = 0;
     // If we don't have a token yet, try to fetch it proactively
     if state.cookies.id.is_empty() || state.cookies.seed.is_empty() {
         warn!("cookie.json missing required fields (id/seed)");
@@ -283,48 +288,71 @@ async fn get_channel(
         )
             .into_response();
     }
-    if state.token.read().is_empty() {
-        if let Ok(t) = refresh_token(&state).await {
-            *state.token.write() = t;
-        }
-    }
-    let content = loop {
-        attempt += 1;
+
+    let content = backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
         let token = state.token.read().clone();
-        let url = format!(
-            "{}?token={}&hash={}",
-            my_url,
-            token,
-            state.user_hash.as_str()
-        );
-        match state.client.get(&url).send().await {
-            Ok(resp) if resp.status().as_u16() == 404 && attempt < 200 => {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                continue;
+
+        let params = [("token", token.as_str()), ("hash", &state.cookies.id)];
+
+        let url = reqwest::Url::parse_with_params(&my_url, &params).expect("valid URL with params");
+
+        info!(url = %url, "Fetching channel content");
+        match state.client.get(url).send().await {
+            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
+                warn!("Resource not found...");
+                Err(backoff::Error::Permanent(anyhow!("Resource not found")))
             }
-            Ok(resp) if resp.status().as_u16() == 403 && attempt < 3 => {
+            Ok(resp) if resp.status() == StatusCode::FORBIDDEN => {
                 // Refresh token via API (Python calls API.getToken and pulls quoted JSON value)
+                info!(status=%resp.status(), "Token refresh attempt");
                 match refresh_token(&state).await {
                     Ok(new_token) => {
+                        info!(new_token = %new_token, "Token refreshed successfully");
                         *state.token.write() = new_token;
-                        continue;
+                        Err(backoff::Error::transient(anyhow!("Token refreshed")))
                     }
                     Err(e) => {
                         warn!("Token refresh failed: {}", e);
-                        return (StatusCode::BAD_GATEWAY, "Token refresh failed").into_response();
+                        Err(backoff::Error::Permanent(anyhow!("Token refresh failed")))
                     }
                 }
+            }
+            Ok(resp) if resp.status().is_client_error() => {
+                let code = resp.status();
+                let preview = resp.text().await.unwrap_or_default();
+                warn!(
+                    %code,
+                    preview = preview.lines().next().unwrap_or(""),
+                    "Upstream client error"
+                );
+                Err(backoff::Error::Permanent(anyhow!(
+                    "Upstream client error: {}",
+                    code
+                )))
+            }
+            Ok(resp) if resp.status().is_server_error() => {
+                let code = resp.status();
+                let preview = resp.text().await.unwrap_or_default();
+                warn!(
+                    %code,
+                    preview = preview.lines().next().unwrap_or(""),
+                    "Upstream server error"
+                );
+                Err(backoff::Error::transient(anyhow!(
+                    "Upstream server error: {}",
+                    code
+                )))
             }
             Ok(resp) if resp.status().is_success() => {
                 let status = resp.status();
                 match resp.text().await {
                     Ok(text) => {
                         info!(%status, "Upstream OK");
-                        break text;
+                        Ok(text)
                     }
                     Err(e) => {
                         warn!("Read failed: {}", e);
-                        return (StatusCode::BAD_GATEWAY, "Read failed").into_response();
+                        Err(backoff::Error::Permanent(anyhow!(e)))
                     }
                 }
             }
@@ -334,14 +362,29 @@ async fn get_channel(
                 warn!(
                     %code,
                     preview = preview.lines().next().unwrap_or(""),
-                    "Upstream error"
+                    "Upstream other error"
                 );
-                return (code, "Upstream error").into_response();
+                Err(backoff::Error::Permanent(anyhow!(
+                    "Upstream other error: {}",
+                    code
+                )))
             }
             Err(e) => {
                 warn!("Fetch failed: {}", e);
-                return (StatusCode::BAD_GATEWAY, "Fetch failed").into_response();
+                Err(backoff::Error::permanent(anyhow!(e)))
             }
+        }
+    })
+    .await;
+
+    let content = match content {
+        Ok(c) => {
+            info!("Channel content fetched successfully");
+            c
+        }
+        Err(e) => {
+            warn!("Channel fetch failed: {}", e);
+            return (StatusCode::BAD_GATEWAY, "Channel fetch failed").into_response();
         }
     };
 
@@ -393,6 +436,11 @@ async fn get_channel(
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    token: String,
+}
+
 async fn refresh_token(state: &AppState) -> Result<String> {
     if state.cookies.seed.is_empty() {
         return Err(anyhow::anyhow!("Missing cookie seed"));
@@ -404,17 +452,25 @@ async fn refresh_token(state: &AppState) -> Result<String> {
         .send()
         .await?;
     let body = resp.text().await?;
-    // Python does: .decode().split('"')[3]
-    let token = body.split('"').nth(3).unwrap_or("").to_string();
-    Ok(urlencoding::encode(&token.replace("%5C", "")).into_owned())
+    let TokenResponse { token }: TokenResponse = match serde_json::from_str(&body) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("Failed to parse token response: {}", e);
+            return Err(anyhow::anyhow!("Token response parse error"));
+        }
+    };
+    Ok(token)
 }
 
 fn random_string(len: usize) -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(len)
-        .map(char::from)
+    use rand::{distributions::Uniform, Rng};
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| {
+            let idx = rng.sample(Uniform::from(0..CHARSET.len()));
+            CHARSET[idx] as char
+        })
         .collect()
 }
 
@@ -539,11 +595,11 @@ fn api_get_builder(
         .header("Sec-Fetch-Mode", "cors")
         .header("Sec-Fetch-Site", "cross-site")
         .header("sec-ch-ua-mobile", "?0")
-        .header("sec-ch-ua-platform", "Windows")
+    .header("sec-ch-ua-platform", "Windows")
 }
 
 fn sign(cookies: &Cookies, endpoint: &str) -> Result<(String, String)> {
-    let nonce = random_string(11) + &random_string(11);
+    let nonce = random_string(21);
     let date = time30();
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(cookies.seed.as_bytes())?;
     use hmac::Mac;
