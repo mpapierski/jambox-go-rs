@@ -65,6 +65,9 @@ struct Cli {
     /// Data directory for cookie.json and jambox.db (env: JAMBOX_DATA_DIR)
     #[arg(long, env = "JAMBOX_DATA_DIR", default_value = ".")]
     data_dir: PathBuf,
+    /// Stream quality segment to inject before playlist.m3u8 (env: JAMBOX_QUALITY)
+    #[arg(long, env = "JAMBOX_QUALITY", default_value = "high")]
+    quality: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -81,6 +84,7 @@ struct AppState {
     db_pool: db::SqlitePool,
     host: Arc<str>,
     port: u16,
+    quality: Arc<str>,
 }
 
 #[tokio::main]
@@ -149,6 +153,7 @@ async fn main() -> Result<()> {
         db_pool,
         host: cli.host.into(),
         port: cli.port,
+        quality: cli.quality.into(),
     };
 
     match refresh_token(&state).await {
@@ -273,7 +278,8 @@ async fn get_channel(
 
     let mut my_url = ch.url.clone();
     if let Some(idx) = my_url.find("playlist.m3u8") {
-        my_url = format!("{}high/{}", &my_url[..idx], &my_url[idx..]);
+        // Insert configured quality segment before playlist.m3u8
+        my_url = format!("{}{}/{}", &my_url[..idx], &*state.quality, &my_url[idx..]);
     }
 
     let parsed = Url::parse(&my_url).ok();
