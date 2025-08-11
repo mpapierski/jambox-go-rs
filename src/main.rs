@@ -22,6 +22,7 @@ mod db;
 mod schema;
 use assets::{AssetUrlField, Assets};
 use dashmap::DashMap;
+use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 use std::{
     collections::HashSet,
     fs,
@@ -34,7 +35,7 @@ use tokio::{
     process::Command,
 };
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 // asset schema moved to assets.rs
 
@@ -339,7 +340,7 @@ async fn get_channel(
     State(state): State<AppState>,
     PathParam(tail): PathParam<String>,
 ) -> impl IntoResponse {
-    // Support both on-demand ffmpeg proxied HLS and direct playlist rewriting.
+    // Support on-demand ffmpeg proxied HLS.
     // Paths we accept:
     //   /{id}.m3u8 -> master playlist proxied (ffmpeg) or rewritten upstream
     //   /{id}/{segment}.ts -> segment served from ffmpeg output dir
@@ -383,18 +384,18 @@ async fn get_channel(
     info!(channel = %ch.name, "Channel request");
 
     let mut my_url = ch.url.clone();
-    // let mut my_url = my_url.replace("sgtsa.pl","sgt.net.pl");
 
     // Log selected quality bitrate if known
     if let Some(info) = state.qualities.get(state.quality.as_ref()) {
         info!(selected_quality = %state.quality, bitrate = info.bitrate, label = %info.label, "Serving channel with quality");
     }
+
     if let Some(idx) = my_url.find("playlist.m3u8") {
         // Insert configured quality segment before playlist.m3u8
         my_url = format!("{}{}/{}", &my_url[..idx], &*state.quality, &my_url[idx..]);
     }
 
-    let parsed = Url::parse(&my_url).ok();
+    // let parsed = Url::parse(&my_url).ok();
     info!(request_url = %my_url, "Request url");
 
     // If we don't have a token yet, try to fetch it proactively
@@ -407,110 +408,6 @@ async fn get_channel(
             .into_response();
     }
 
-    let content = backoff::future::retry(backoff::ExponentialBackoff::default(), || async {
-        let token = state.token.read().clone();
-
-        let params = [("token", token.as_str()), ("hash", &state.cookies.id)];
-
-        let url = reqwest::Url::parse_with_params(&my_url, &params).expect("valid URL with params");
-
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("User-Agent", HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:141.0) Gecko/20100101 Firefox/141.0"));
-        headers.insert("Accept", HeaderValue::from_static("*/*"));
-        headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate, br, zstd"));
-        headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
-        headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-        headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
-
-        info!(url = %url, "Fetching channel content");
-        match state.client.get(url).headers(headers).timeout(Duration::from_secs(10)).send().await {
-            Ok(resp) if resp.status() == StatusCode::NOT_FOUND => {
-                warn!("Resource not found...");
-                Err(backoff::Error::Permanent(anyhow!("Resource not found")))
-            }
-            Ok(resp) if resp.status() == StatusCode::FORBIDDEN => {
-                // Refresh token via API (Python calls API.getToken and pulls quoted JSON value)
-                info!(status=%resp.status(), "Token refresh attempt");
-                match refresh_token(&state).await {
-                    Ok(new_token) => {
-                        info!(new_token = %new_token, "Token refreshed successfully");
-                        *state.token.write() = new_token;
-                        Err(backoff::Error::transient(anyhow!("Token refreshed")))
-                    }
-                    Err(e) => {
-                        warn!("Token refresh failed: {}", e);
-                        Err(backoff::Error::Permanent(anyhow!("Token refresh failed")))
-                    }
-                }
-            }
-            Ok(resp) if resp.status().is_client_error() => {
-                let code = resp.status();
-                let preview = resp.text().await.unwrap_or_default();
-                warn!(
-                    %code,
-                    preview = preview.lines().next().unwrap_or(""),
-                    "Upstream client error"
-                );
-                Err(backoff::Error::Permanent(anyhow!(
-                    "Upstream client error: {}",
-                    code
-                )))
-            }
-            Ok(resp) if resp.status().is_server_error() => {
-                let code = resp.status();
-                let preview = resp.text().await.unwrap_or_default();
-                warn!(
-                    %code,
-                    preview = preview.lines().next().unwrap_or(""),
-                    "Upstream server error"
-                );
-                Err(backoff::Error::transient(anyhow!(
-                    "Upstream server error: {}",
-                    code
-                )))
-            }
-            Ok(resp) if resp.status().is_success() => {
-                let status = resp.status();
-                match resp.text().await {
-                    Ok(text) => {
-                        info!(%status, "Upstream OK");
-                        Ok(text)
-                    }
-                    Err(e) => {
-                        warn!("Read failed: {}", e);
-                        Err(backoff::Error::Permanent(anyhow!(e)))
-                    }
-                }
-            }
-            Ok(resp) => {
-                let code = resp.status();
-                let preview = resp.text().await.unwrap_or_default();
-                warn!(
-                    %code,
-                    preview = preview.lines().next().unwrap_or(""),
-                    "Upstream other error"
-                );
-                Err(backoff::Error::Permanent(anyhow!(
-                    "Upstream other error: {}",
-                    code
-                )))
-            }
-            Err(e) => {
-                warn!(is_timeout=e.is_timeout(), "Fetch failed: {}", e);
-                Err(backoff::Error::permanent(anyhow!(e)))
-            }
-        }
-    })
-    .await;
-
-    let content = match content {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Channel fetch failed: {}", e);
-            return (StatusCode::BAD_GATEWAY, "Channel fetch failed").into_response();
-        }
-    };
-    let out = rewrite_key_line(content, parsed.as_ref());
     // Build full upstream URL (with token/hash) for ffmpeg direct ingestion instead of local file
     let ffmpeg_playlist_url = {
         if let Ok(mut u) = reqwest::Url::parse(&my_url) {
@@ -538,37 +435,35 @@ async fn get_channel(
         }
     }
 
-    if let Some(sess) = state.sessions.get(&id) {
-        sess.touch();
-        let playlist_path = sess.dir.join("out.m3u8");
-        match fs::read_to_string(&playlist_path) {
-            Ok(text) => {
-                let rewritten = rewrite_playlist_urls(&text, id);
-                return (
-                    StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-                    )],
-                    rewritten,
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                warn!(error=%e, ?playlist_path, "Failed to read ffmpeg playlist; falling back to upstream rewrite");
+    match state.sessions.get(&id) {
+        Some(sess) => {
+            sess.touch();
+            let playlist_path = sess.dir.join("out.m3u8");
+            match fs::read_to_string(&playlist_path) {
+                Ok(text) => {
+                    let rewritten = rewrite_playlist_urls(&text, id);
+                    return (
+                        StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                        )],
+                        rewritten,
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    warn!(error=%e, ?playlist_path, "Failed to read ffmpeg playlist; falling back to upstream rewrite");
+                    return (StatusCode::SERVICE_UNAVAILABLE, "service not available")
+                        .into_response();
+                }
             }
         }
+        None => {
+            warn!(session_id=%id, "FFmpeg session not found");
+            return (StatusCode::SERVICE_UNAVAILABLE, "service not available").into_response();
+        }
     }
-
-    (
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-        )],
-        out,
-    )
-        .into_response()
 }
 
 fn rewrite_playlist_urls(text: &str, id: usize) -> String {
@@ -587,29 +482,6 @@ fn rewrite_playlist_urls(text: &str, id: usize) -> String {
         .join("\n")
 }
 
-fn rewrite_key_line(content: String, parsed: Option<&Url>) -> String {
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let key_idx = lines.iter().position(|l| l.starts_with("#EXT-X-KEY:"));
-    if let Some(i) = key_idx {
-        static RE_KEY: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex")
-        });
-        if let Some(caps) = RE_KEY.captures(&lines[i]) {
-            let uri = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-            let iv = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-            let abs_uri = if let Some(base) = parsed {
-                base.join(uri)
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|_| uri.to_string())
-            } else {
-                uri.to_string()
-            };
-            lines[i] = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{abs_uri}\",IV=\"{iv}\"");
-        }
-    }
-    lines.join("\n")
-}
-
 async fn start_ffmpeg_session(
     state: &AppState,
     id: usize,
@@ -621,6 +493,25 @@ async fn start_ffmpeg_session(
     // Output single variant playlist out.m3u8 with rolling window.
     let output = dir.join("out.m3u8");
     info!(session_id=%id, url=%upstream_url, dir=?dir, "Starting new ffmpeg session");
+    // Start filesystem watcher BEFORE launching ffmpeg so no events are missed.
+    let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let target_name = output
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    let dir_watch = dir.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(mut watcher) = recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = evt_tx.send(event);
+            }
+        }) {
+            let _ = watcher.watch(&dir_watch, RecursiveMode::NonRecursive);
+            std::thread::park_timeout(std::time::Duration::from_secs(15));
+        }
+    });
+
+    // Now launch ffmpeg
     let mut cmd = Command::new("ffmpeg");
     cmd.arg("-y")
         .arg("-protocol_whitelist")
@@ -660,18 +551,34 @@ async fn start_ffmpeg_session(
             }
         });
     }
-    // Wait for playlist to appear (retry quick a few times)
-    for _ in 0..8 {
-        if output.exists() {
-            break;
+    // Wait for one of: playlist create/modify event, ffmpeg exit (error), or timeout.
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(timeout);
+    loop {
+        tokio::select! {
+            _ = &mut timeout => {
+                return Err(anyhow!("ffmpeg failed: playlist creation timeout (10s) for {}", output.display()));
+            }
+            status = child.wait() => {
+                let st = status?; // process exit status
+                return Err(anyhow!("ffmpeg exited before playlist creation: {:?}", st.code()));
+            }
+            maybe_event = evt_rx.recv() => {
+                let Some(event) = maybe_event else {
+                    return Err(anyhow!("watcher closed before playlist creation: {}", output.display()));
+                };
+                // Only proceed if event is Create/Modify referencing out.m3u8
+                let is_relevant_kind = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+                debug!(session_id=%id, ?event, "Received file system event: {:?}", event);
+                if is_relevant_kind {
+                    if event.paths.iter().any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false)) {
+                        info!(session_id=%id, "FFmpeg session started successfully");
+                        break; // success
+                    }
+                }
+                // otherwise keep waiting
+            }
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    if !output.exists() {
-        return Err(anyhow!(
-            "ffmpeg failed: playlist not created: {}",
-            output.display()
-        ));
     }
     Ok(FfmpegSession {
         dir: Arc::new(dir),
