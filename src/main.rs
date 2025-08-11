@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
         session_idle: Duration::from_secs(cli.session_idle_secs),
         hls_segment_duration: cli.hls_segment_duration,
         hls_playlist_size: cli.hls_playlist_size,
-    data_dir: Arc::new(cli.data_dir.clone()),
+        data_dir: Arc::new(cli.data_dir.clone()),
     };
 
     // Spawn background GC task for idle ffmpeg sessions
@@ -404,30 +404,70 @@ async fn get_tvg_logo(
                         .map(|d| format!("\"{:x}-{:x}\"", size, d.as_secs()))
                 });
                 // Conditional checks (ETag first)
-                if let (Some(tag), Some(inm)) = (etag.as_ref(), headers.get(header::IF_NONE_MATCH)) {
+                if let (Some(tag), Some(inm)) = (etag.as_ref(), headers.get(header::IF_NONE_MATCH))
+                {
                     if let Ok(inm_str) = inm.to_str() {
-                        if inm_str.split(',').any(|t| t.trim()==tag.as_str()) {
-                            let mut resp = axum::http::Response::builder().status(StatusCode::NOT_MODIFIED).body(axum::body::Body::empty()).unwrap();
-                            if let Ok(val) = HeaderValue::from_str(tag) { resp.headers_mut().insert(header::ETAG, val); }
-                            if let Some(lm) = &last_mod_str { if let Ok(val) = HeaderValue::from_str(lm) { resp.headers_mut().insert(header::LAST_MODIFIED, val); } }
-                            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+                        if inm_str.split(',').any(|t| t.trim() == tag.as_str()) {
+                            let mut resp = axum::http::Response::builder()
+                                .status(StatusCode::NOT_MODIFIED)
+                                .body(axum::body::Body::empty())
+                                .unwrap();
+                            if let Ok(val) = HeaderValue::from_str(tag) {
+                                resp.headers_mut().insert(header::ETAG, val);
+                            }
+                            if let Some(lm) = &last_mod_str {
+                                if let Ok(val) = HeaderValue::from_str(lm) {
+                                    resp.headers_mut().insert(header::LAST_MODIFIED, val);
+                                }
+                            }
+                            resp.headers_mut().insert(
+                                header::CACHE_CONTROL,
+                                HeaderValue::from_static("public, max-age=86400"),
+                            );
                             return resp.into_response();
                         }
                     }
                 }
                 // If-Modified-Since (second precision)
-                if let (Some(modified), Some(ims_val)) = (modified_opt, headers.get(header::IF_MODIFIED_SINCE)) {
-                    if let Ok(ims_str) = ims_val.to_str() { if let Ok(ims_time) = httpdate::parse_http_date(ims_str) {
-                        let mod_secs = modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
-                        let ims_secs = ims_time.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
-                        if let (Some(ms), Some(isec)) = (mod_secs, ims_secs) { if ms <= isec { // not modified
-                            let mut resp = axum::http::Response::builder().status(StatusCode::NOT_MODIFIED).body(axum::body::Body::empty()).unwrap();
-                            if let Some(lm) = &last_mod_str { if let Ok(val) = HeaderValue::from_str(lm) { resp.headers_mut().insert(header::LAST_MODIFIED, val); } }
-                            if let Some(ref tag) = etag { if let Ok(val) = HeaderValue::from_str(tag) { resp.headers_mut().insert(header::ETAG, val); } }
-                            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
-                            return resp.into_response();
-                        }}
-                    }}
+                if let (Some(modified), Some(ims_val)) =
+                    (modified_opt, headers.get(header::IF_MODIFIED_SINCE))
+                {
+                    if let Ok(ims_str) = ims_val.to_str() {
+                        if let Ok(ims_time) = httpdate::parse_http_date(ims_str) {
+                            let mod_secs = modified
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| d.as_secs());
+                            let ims_secs = ims_time
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| d.as_secs());
+                            if let (Some(ms), Some(isec)) = (mod_secs, ims_secs) {
+                                if ms <= isec {
+                                    // not modified
+                                    let mut resp = axum::http::Response::builder()
+                                        .status(StatusCode::NOT_MODIFIED)
+                                        .body(axum::body::Body::empty())
+                                        .unwrap();
+                                    if let Some(lm) = &last_mod_str {
+                                        if let Ok(val) = HeaderValue::from_str(lm) {
+                                            resp.headers_mut().insert(header::LAST_MODIFIED, val);
+                                        }
+                                    }
+                                    if let Some(ref tag) = etag {
+                                        if let Ok(val) = HeaderValue::from_str(tag) {
+                                            resp.headers_mut().insert(header::ETAG, val);
+                                        }
+                                    }
+                                    resp.headers_mut().insert(
+                                        header::CACHE_CONTROL,
+                                        HeaderValue::from_static("public, max-age=86400"),
+                                    );
+                                    return resp.into_response();
+                                }
+                            }
+                        }
+                    }
                 }
                 // Stream body
                 let stream = ReaderStream::new(file);
