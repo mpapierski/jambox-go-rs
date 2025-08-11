@@ -300,7 +300,6 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
-        .route("/tvg-logo/:id", get(get_tvg_logo)) // legacy path
         .route("/channel/:id/logo.png", get(get_tvg_logo))
         .route("/channel/:id/playlist.m3u8", get(channel_playlist))
         .route("/channel/:id/:segment", get(channel_segment))
