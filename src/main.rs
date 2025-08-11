@@ -120,6 +120,7 @@ struct AppState {
     session_idle: Duration,                       // idle timeout
     hls_segment_duration: u32,
     hls_playlist_size: u32,
+    data_dir: Arc<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -240,6 +241,7 @@ async fn main() -> Result<()> {
         session_idle: Duration::from_secs(cli.session_idle_secs),
         hls_segment_duration: cli.hls_segment_duration,
         hls_playlist_size: cli.hls_playlist_size,
+    data_dir: Arc::new(cli.data_dir.clone()),
     };
 
     // Spawn background GC task for idle ffmpeg sessions
@@ -298,7 +300,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
-        .route("/epg", get(get_epg))
+        .route("/tvg-logo/:id", get(get_tvg_logo)) // legacy path
+        .route("/channel/:id/logo.png", get(get_tvg_logo))
         .route("/channel/:id/playlist.m3u8", get(channel_playlist))
         .route("/channel/:id/:segment", get(channel_segment))
         .with_state(state)
@@ -332,7 +335,7 @@ async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
     out.push_str("#EXTM3U\n");
     for (idx, ch) in rows.iter().enumerate() {
         out.push_str(&format!(
-            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"/tvg-logo/{}\",{}\n",
+            "#EXTINF:-1 tvg-id=\"{}\" tvg-name=\"{}\" tvg-logo=\"/channel/{}/logo.png\",{}\n",
             idx, ch.name, idx, ch.name
         ));
         out.push_str(&format!(
@@ -357,16 +360,10 @@ async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
         .into_response()
 }
 
-async fn get_epg() -> impl IntoResponse {
-    match read_bytes("epg.xml") {
-        Ok(bytes) => (StatusCode::OK, [("Content-Type", "application/xml")], bytes).into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "epg.xml not found").into_response(),
-    }
-}
-
 async fn get_tvg_logo(
     State(state): State<AppState>,
     PathParam(id): PathParam<usize>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let mut conn = match state.db_pool.get() {
         Ok(c) => c,
@@ -374,60 +371,101 @@ async fn get_tvg_logo(
     };
     let row = db::channel_at(&mut conn, id).unwrap_or_default();
     if let Some(ch) = row.as_ref() {
-        let url = format!("https://static.sgtsa.pl/channels/logos/{}.png", ch.sgtid);
-        match state.client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let bytes = resp.bytes().await.unwrap_or_default();
-                (StatusCode::OK, [("Content-Type", "image/png")], bytes).into_response()
+        let cache_dir = state.data_dir.join("logos");
+        let _ = fs::create_dir_all(&cache_dir);
+        let path = cache_dir.join(format!("{}.png", ch.sgtid));
+        let fetch_needed = match fs::metadata(&path) {
+            Ok(meta) => meta.len() == 0, // zero-size -> refetch
+            Err(_) => true,
+        };
+        if fetch_needed {
+            let url = format!("https://static.sgtsa.pl/channels/logos/{}.png", ch.sgtid);
+            match state.client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let _ = fs::write(&path, &bytes);
+                    }
+                }
+                _ => { /* ignore fetch failure, fall through */ }
             }
-            Ok(resp) => (resp.status(), "Upstream error").into_response(),
-            Err(_) => (StatusCode::BAD_GATEWAY, "Fetch failed").into_response(),
         }
+        if let Ok(file) = tokio::fs::File::open(&path).await {
+            if let Ok(meta) = file.metadata().await {
+                use axum::body::Body;
+                use axum::http::{header, HeaderValue};
+                use tokio_util::io::ReaderStream;
+                let modified_opt = meta.modified().ok();
+                let last_mod_str = modified_opt.map(httpdate::fmt_http_date);
+                // Build a simple ETag from size + mtime seconds
+                let size = meta.len();
+                let etag = modified_opt.and_then(|mtime| {
+                    mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| format!("\"{:x}-{:x}\"", size, d.as_secs()))
+                });
+                // Conditional checks (ETag first)
+                if let (Some(tag), Some(inm)) = (etag.as_ref(), headers.get(header::IF_NONE_MATCH)) {
+                    if let Ok(inm_str) = inm.to_str() {
+                        if inm_str.split(',').any(|t| t.trim()==tag.as_str()) {
+                            let mut resp = axum::http::Response::builder().status(StatusCode::NOT_MODIFIED).body(axum::body::Body::empty()).unwrap();
+                            if let Ok(val) = HeaderValue::from_str(tag) { resp.headers_mut().insert(header::ETAG, val); }
+                            if let Some(lm) = &last_mod_str { if let Ok(val) = HeaderValue::from_str(lm) { resp.headers_mut().insert(header::LAST_MODIFIED, val); } }
+                            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+                            return resp.into_response();
+                        }
+                    }
+                }
+                // If-Modified-Since (second precision)
+                if let (Some(modified), Some(ims_val)) = (modified_opt, headers.get(header::IF_MODIFIED_SINCE)) {
+                    if let Ok(ims_str) = ims_val.to_str() { if let Ok(ims_time) = httpdate::parse_http_date(ims_str) {
+                        let mod_secs = modified.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+                        let ims_secs = ims_time.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+                        if let (Some(ms), Some(isec)) = (mod_secs, ims_secs) { if ms <= isec { // not modified
+                            let mut resp = axum::http::Response::builder().status(StatusCode::NOT_MODIFIED).body(axum::body::Body::empty()).unwrap();
+                            if let Some(lm) = &last_mod_str { if let Ok(val) = HeaderValue::from_str(lm) { resp.headers_mut().insert(header::LAST_MODIFIED, val); } }
+                            if let Some(ref tag) = etag { if let Ok(val) = HeaderValue::from_str(tag) { resp.headers_mut().insert(header::ETAG, val); } }
+                            resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=86400"));
+                            return resp.into_response();
+                        }}
+                    }}
+                }
+                // Stream body
+                let stream = ReaderStream::new(file);
+                let body = Body::from_stream(stream);
+                let mut resp = axum::http::Response::builder()
+                    .status(StatusCode::OK)
+                    .body(body)
+                    .unwrap();
+                if let Some(lm) = &last_mod_str {
+                    if let Ok(val) = HeaderValue::from_str(lm) {
+                        resp.headers_mut().insert(header::LAST_MODIFIED, val);
+                    }
+                }
+                if let Some(ref tag) = etag {
+                    if let Ok(val) = HeaderValue::from_str(tag) {
+                        resp.headers_mut().insert(header::ETAG, val);
+                    }
+                }
+                resp.headers_mut()
+                    .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+                resp.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=86400"),
+                );
+                return resp.into_response();
+            }
+        }
+        (StatusCode::NOT_FOUND, "Logo unavailable").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Channel not found").into_response()
     }
 }
 
-async fn get_channel(
+async fn channel_playlist(
     State(state): State<AppState>,
-    PathParam(tail): PathParam<String>,
+    PathParam(id): PathParam<usize>,
 ) -> impl IntoResponse {
-    // Support on-demand ffmpeg proxied HLS.
-    // Paths we accept:
-    //   /{id}.m3u8 -> master playlist proxied (ffmpeg) or rewritten upstream
-    //   /{id}/{segment}.ts -> segment served from ffmpeg output dir
-    let parts = tail.split('/').collect::<Vec<_>>();
-    if parts.len() > 1 {
-        // segment request - stream file using async file -> Body
-        if let Ok(id) = parts[0].parse::<usize>() {
-            if let Some(sess) = state.sessions.get(&id) {
-                let seg_name = parts[1];
-                let path = sess.dir.join(seg_name);
-                if let Ok(file) = tokio::fs::File::open(&path).await {
-                    use axum::body::Body;
-                    use tokio_util::io::ReaderStream;
-                    let stream = ReaderStream::new(file);
-                    let body = Body::from_stream(stream);
-                    sess.touch();
-                    return (
-                        StatusCode::OK,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            axum::http::HeaderValue::from_static("video/mp2t"),
-                        )],
-                        body,
-                    )
-                        .into_response();
-                }
-            }
-        }
-        return (StatusCode::NOT_FOUND, "Segment not found").into_response();
-    }
-
-    let id_str = parts[0].strip_suffix(".m3u8").unwrap_or(parts[0]);
-    let Ok(id) = id_str.parse::<usize>() else {
-        return (StatusCode::NOT_FOUND, "Invalid id").into_response();
-    };
     let mut conn = match state.db_pool.get() {
         Ok(c) => c,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
@@ -797,26 +835,6 @@ fn time30() -> String {
         .as_secs();
     ((now / 30) * 30).to_string()
 }
-fn resolve_path(name: &str) -> Option<PathBuf> {
-    let here = std::path::Path::new(name);
-    if here.exists() {
-        return Some(here.to_path_buf());
-    }
-    let parent = std::path::Path::new("..").join(name);
-    if parent.exists() {
-        return Some(parent);
-    }
-    None
-}
-
-fn read_bytes(name: &str) -> std::io::Result<Vec<u8>> {
-    if let Some(p) = resolve_path(name) {
-        fs::read(p)
-    } else {
-        Err(std::io::Error::from(std::io::ErrorKind::NotFound))
-    }
-}
-
 async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnection) -> Result<()> {
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
