@@ -87,6 +87,9 @@ struct Cli {
     /// Directory to store on-demand repackaged HLS sessions (env: JAMBOX_STREAM_DIR, default: system temp + jambox_streams)
     #[arg(long, env = "JAMBOX_STREAM_DIR")]
     stream_dir: Option<PathBuf>,
+    /// Idle seconds before an ffmpeg session is garbage collected (env: JAMBOX_SESSION_IDLE_SECS)
+    #[arg(long, env = "JAMBOX_SESSION_IDLE_SECS", default_value_t = 180)]
+    session_idle_secs: u64,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -107,12 +110,14 @@ struct AppState {
     qualities: Arc<Qualities>,
     sessions: Arc<DashMap<usize, FfmpegSession>>, // channel id -> session
     stream_dir: Arc<PathBuf>,                     // root directory for ffmpeg session dirs
+    session_idle: Duration,                       // idle timeout
 }
 
 #[derive(Clone)]
 struct FfmpegSession {
     dir: Arc<PathBuf>,                    // directory with playlist + segments
     last_access: Arc<RwLock<SystemTime>>, // for GC
+    child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>, // ffmpeg process
 }
 
 impl FfmpegSession {
@@ -223,7 +228,47 @@ async fn main() -> Result<()> {
         qualities: Arc::new(qualities),
         sessions: Arc::new(DashMap::new()),
         stream_dir: Arc::new(stream_root),
+        session_idle: Duration::from_secs(cli.session_idle_secs),
     };
+
+    // Spawn background GC task for idle ffmpeg sessions
+    {
+        let state_gc = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let now = SystemTime::now();
+                let idle = state_gc.session_idle;
+                let mut to_remove: Vec<usize> = Vec::new();
+                for entry in state_gc.sessions.iter() {
+                    let last = *entry.last_access.read();
+                    if now.duration_since(last).unwrap_or(Duration::ZERO) > idle {
+                        to_remove.push(*entry.key());
+                    }
+                }
+                if to_remove.is_empty() {
+                    continue;
+                }
+                for id in to_remove {
+                    if let Some((_, sess)) = state_gc.sessions.remove(&id) {
+                        // Kill process
+                        if let Some(mut child) = sess.child.lock().await.take() {
+                            if let Err(e) = child.kill().await {
+                                warn!(session_id=%id, error=%e, "Failed to kill ffmpeg child (maybe already exited)");
+                            }
+                            let _ = child.wait().await;
+                        }
+                        // Remove directory
+                        if let Err(e) = fs::remove_dir_all(&*sess.dir) {
+                            warn!(session_id=%id, error=%e, dir=?sess.dir, "Failed to remove session dir");
+                        }
+                        info!(session_id=%id, "GC removed idle session");
+                    }
+                }
+            }
+        });
+    }
 
     match refresh_token(&state).await {
         Ok(t) => {
@@ -348,8 +393,8 @@ async fn get_channel(
                 let seg_name = parts[1];
                 let path = sess.dir.join(seg_name);
                 if let Ok(file) = tokio::fs::File::open(&path).await {
-                    use tokio_util::io::ReaderStream;
                     use axum::body::Body;
+                    use tokio_util::io::ReaderStream;
                     let stream = ReaderStream::new(file);
                     let body = Body::from_stream(stream);
                     sess.touch();
@@ -582,6 +627,7 @@ async fn start_ffmpeg_session(
     Ok(FfmpegSession {
         dir: Arc::new(dir),
         last_access: Arc::new(RwLock::new(SystemTime::now())),
+        child: Arc::new(tokio::sync::Mutex::new(Some(child))),
     })
 }
 
