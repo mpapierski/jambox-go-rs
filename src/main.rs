@@ -23,6 +23,10 @@ use assets::{AssetUrlField, Assets};
 use dashmap::DashMap;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
 
+use prometheus::{
+    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Opts, Registry, TextEncoder,
+};
 use std::{
     collections::HashSet,
     fs,
@@ -123,6 +127,7 @@ struct AppState {
     hls_segment_duration: u32,
     hls_playlist_size: u32,
     data_dir: Arc<PathBuf>,
+    metrics: Arc<Metrics>,
 }
 
 #[derive(Clone)]
@@ -130,11 +135,184 @@ struct FfmpegSession {
     dir: Arc<PathBuf>,                    // directory with playlist + segments
     last_access: Arc<RwLock<SystemTime>>, // for GC
     child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>, // ffmpeg process
+    created_at: SystemTime,               // for duration metric
+    channel_name: Arc<str>,
 }
 
 impl FfmpegSession {
     fn touch(&self) {
         *self.last_access.write() = SystemTime::now();
+    }
+}
+
+// Prometheus metrics container
+struct Metrics {
+    registry: Registry,
+    active_sessions: IntGauge,
+    created_sessions_total: IntCounter,
+    removed_sessions_total: IntCounter,
+    session_lifetime_seconds: Histogram, // lifetime histogram recorded at removal
+    channel_bitrate_bps: GaugeVec,
+    session_duration_seconds: GaugeVec, // real-time duration updated from out_time_ms
+    dup_frames_total: IntCounterVec,
+    drop_frames_total: IntCounterVec,
+    frames_total: IntCounterVec,
+    token_refresh_total: IntCounter,
+    upstream_request_duration_ms: HistogramVec, // labeled by endpoint
+    upstream_playlist_http_responses_total: IntCounterVec, // labels: url, status_code
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+        let active_sessions = IntGauge::new(
+            "jambox_active_sessions",
+            "Number of currently active ffmpeg sessions",
+        )
+        .unwrap();
+        let created_sessions_total = IntCounter::new(
+            "jambox_sessions_created_total",
+            "Total number of ffmpeg sessions ever created",
+        )
+        .unwrap();
+        let removed_sessions_total = IntCounter::new(
+            "jambox_sessions_removed_total",
+            "Total number of ffmpeg sessions removed",
+        )
+        .unwrap();
+        let duration_opts = HistogramOpts::new(
+            "jambox_session_lifetime_seconds",
+            "Lifetime of ffmpeg sessions in seconds (recorded when session ends)",
+        )
+        .buckets(vec![
+            1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0,
+        ]);
+        let session_lifetime_seconds = Histogram::with_opts(duration_opts).unwrap();
+        let channel_bitrate_bps = GaugeVec::new(
+            Opts::new(
+                "jambox_channel_bitrate_bits_per_second",
+                "Instantaneous bitrate per channel derived from ffmpeg -progress",
+            ),
+            &["channel_id", "channel_name"],
+        )
+        .unwrap();
+        let session_duration_seconds = GaugeVec::new(
+            Opts::new(
+                "jambox_session_duration_seconds",
+                "Real-time current streaming duration per active session (seconds)",
+            ),
+            &["channel_id", "channel_name"],
+        )
+        .unwrap();
+        let dup_frames_total = IntCounterVec::new(
+            Opts::new(
+                "jambox_session_dup_frames_total",
+                "Total duplicate frames reported by ffmpeg per session",
+            ),
+            &["channel_id", "channel_name"],
+        )
+        .unwrap();
+        let drop_frames_total = IntCounterVec::new(
+            Opts::new(
+                "jambox_session_drop_frames_total",
+                "Total dropped frames reported by ffmpeg per session",
+            ),
+            &["channel_id", "channel_name"],
+        )
+        .unwrap();
+        let frames_total = IntCounterVec::new(
+            Opts::new(
+                "jambox_session_frames_total",
+                "Total frames processed (frame field from -progress) per session",
+            ),
+            &["channel_id", "channel_name"],
+        )
+        .unwrap();
+        let token_refresh_total = IntCounter::new(
+            "jambox_token_refresh_total",
+            "Total number of successful token refresh operations",
+        )
+        .unwrap();
+        let upstream_request_duration_ms = HistogramVec::new(
+            HistogramOpts::new(
+                "jambox_upstream_request_duration_milliseconds",
+                "Upstream request latency in milliseconds per endpoint (label=endpoint)",
+            )
+            .buckets(vec![
+                5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 150.0, 250.0, 400.0, 600.0, 800.0, 1000.0,
+                1500.0, 2000.0, 3000.0, 5000.0, 8000.0, 12000.0,
+            ]),
+            &["endpoint"],
+        )
+        .unwrap();
+        let upstream_playlist_http_responses_total = IntCounterVec::new(
+            Opts::new(
+                "jambox_upstream_playlist_http_responses_total",
+                "Count of upstream playlist HTTP responses by base URL and status code",
+            ),
+            &["url", "status_code"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(active_sessions.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(created_sessions_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(removed_sessions_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(session_lifetime_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(channel_bitrate_bps.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(session_duration_seconds.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(dup_frames_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(drop_frames_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(token_refresh_total.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(upstream_request_duration_ms.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(upstream_playlist_http_responses_total.clone()))
+            .unwrap();
+        registry.register(Box::new(frames_total.clone())).unwrap();
+        Self {
+            registry,
+            active_sessions,
+            created_sessions_total,
+            removed_sessions_total,
+            session_lifetime_seconds,
+            channel_bitrate_bps,
+            session_duration_seconds,
+            dup_frames_total,
+            drop_frames_total,
+            token_refresh_total,
+            upstream_request_duration_ms,
+            upstream_playlist_http_responses_total,
+            frames_total,
+        }
+    }
+    fn on_created(&self) {
+        self.active_sessions.inc();
+        self.created_sessions_total.inc();
+    }
+    fn on_removed(&self, created_at: SystemTime) {
+        if let Ok(d) = SystemTime::now().duration_since(created_at) {
+            self.session_lifetime_seconds.observe(d.as_secs_f64());
+        }
+        self.removed_sessions_total.inc();
+        self.active_sessions.dec();
     }
 }
 
@@ -189,8 +367,9 @@ async fn main() -> Result<()> {
     let db_path = cli.data_dir.join("jambox.db");
     let db_pool = db::init_pool(db_path.to_string_lossy().as_ref())?;
     let mut conn = db_pool.get()?;
+    let metrics = Arc::new(Metrics::new());
     if db::load_channels(&mut conn)?.is_empty() {
-        if let Err(e) = ensure_channels_db(&cookies, &mut conn).await {
+        if let Err(e) = ensure_channels_db(&cookies, &mut conn, &metrics).await {
             warn!("channel load failed: {}", e);
         }
     }
@@ -198,7 +377,7 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", cli.host, cli.port);
 
     // Fetch available qualities (non-fatal on failure, but we use for validation)
-    let qualities = match fetch_qualities(&cookies).await {
+    let qualities = match fetch_qualities(&cookies, &metrics).await {
         Ok(q) => q,
         Err(e) => {
             warn!(error=%e, "Failed to fetch qualities; proceeding without validation");
@@ -244,6 +423,7 @@ async fn main() -> Result<()> {
         hls_segment_duration: cli.hls_segment_duration,
         hls_playlist_size: cli.hls_playlist_size,
         data_dir: Arc::new(cli.data_dir.clone()),
+        metrics: metrics.clone(),
     };
 
     // Spawn background GC task for idle ffmpeg sessions
@@ -278,7 +458,28 @@ async fn main() -> Result<()> {
                         if let Err(e) = fs::remove_dir_all(&*sess.dir) {
                             warn!(session_id=%id, error=%e, dir=?sess.dir, "Failed to remove session dir");
                         }
-                        info!(session_id=%id, "GC removed idle session");
+                        // Remove per-session metric labels
+                        let labels = [&id.to_string(), sess.channel_name.as_ref()];
+                        let _ = state_gc
+                            .metrics
+                            .channel_bitrate_bps
+                            .remove_label_values(&labels);
+                        let _ = state_gc
+                            .metrics
+                            .session_duration_seconds
+                            .remove_label_values(&labels);
+                        let _ = state_gc
+                            .metrics
+                            .dup_frames_total
+                            .remove_label_values(&labels);
+                        let _ = state_gc
+                            .metrics
+                            .drop_frames_total
+                            .remove_label_values(&labels);
+                        let _ = state_gc.metrics.frames_total.remove_label_values(&labels);
+                        // Metrics update
+                        state_gc.metrics.on_removed(sess.created_at);
+                        info!(session_id=%id, channel_name=%sess.channel_name, "GC removed idle session");
                     }
                 }
             }
@@ -302,6 +503,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
+        .route("/metrics", get(get_metrics))
         .route("/channel/:id/logo.png", get(get_tvg_logo))
         .route("/channel/:id/upstream.m3u8", get(channel_upstream_playlist))
         .route("/channel/:id/playlist.m3u8", get(channel_playlist))
@@ -522,9 +724,10 @@ async fn channel_playlist(
     // Start or reuse ffmpeg session (ffmpeg points at local upstream proxy path now)
     if !state.sessions.contains_key(&id) {
         info!(session_id=%id, "Starting new ffmpeg session");
-        match start_ffmpeg_session(&state, id).await {
+        match start_ffmpeg_session(&state, id, &ch.name).await {
             Ok(sess) => {
                 state.sessions.insert(id, sess);
+                state.metrics.on_created();
             }
             Err(e) => {
                 warn!(error=%e, "Failed to start ffmpeg session");
@@ -635,7 +838,11 @@ fn rewrite_playlist_urls(text: &str, id: usize) -> String {
         .join("\n")
 }
 
-async fn start_ffmpeg_session(state: &AppState, id: usize) -> Result<FfmpegSession> {
+async fn start_ffmpeg_session(
+    state: &AppState,
+    id: usize,
+    channel_name: &str,
+) -> Result<FfmpegSession> {
     let dir = state.stream_dir.join(format!("ch_{id}"));
     let _ = fs::create_dir_all(&dir);
     // Use ffmpeg copy codecs to just repackage segments locally.
@@ -665,7 +872,7 @@ async fn start_ffmpeg_session(state: &AppState, id: usize) -> Result<FfmpegSessi
         }
     });
 
-    // Now launch ffmpeg
+    // Launch ffmpeg; we'll read -progress output from its stdout
     let mut child = launch_ffmpeg_child(
         &local_upstream,
         &dir,
@@ -685,12 +892,86 @@ async fn start_ffmpeg_session(state: &AppState, id: usize) -> Result<FfmpegSessi
                 }
                 let msg = line.trim_end();
                 if !msg.is_empty() {
-                    tracing::info!(target = "ffmpeg", "{msg}");
+                    tracing::info!(target = "ffmpeg_stderr", "{msg}");
                 }
                 line.clear();
             }
         });
     }
+    // Spawn progress reader (stdout, -progress pipe:1)
+    if let Some(stdout) = child.stdout.take() {
+        let labels = [&id.to_string(), channel_name];
+        let duration_gauge = state
+            .metrics
+            .session_duration_seconds
+            .with_label_values(&labels);
+        let dup_counter = state.metrics.dup_frames_total.with_label_values(&labels);
+        let drop_counter = state.metrics.drop_frames_total.with_label_values(&labels);
+        let frame_counter = state.metrics.frames_total.with_label_values(&labels);
+        // Capture identifiers for logging inside spawned task
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stdout);
+            let mut cur_time_ms = None;
+            let mut last_dup: u64 = 0;
+            let mut last_drop: u64 = 0;
+            let mut last_frame: u64 = 0;
+            let (mut cur_dup, mut cur_drop) = (0u64, 0u64);
+            let mut cur_frame: u64 = 0;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if let Some((k, v)) = line.trim_end().split_once('=') {
+                            match k {
+                                "out_time_ms" => {
+                                    if let Ok(ms) = v.parse::<u64>() {
+                                        cur_time_ms = Some(ms);
+                                    }
+                                }
+                                "dup_frames" => {
+                                    if let Ok(df) = v.parse::<u64>() {
+                                        cur_dup = df;
+                                    }
+                                }
+                                "drop_frames" => {
+                                    if let Ok(df) = v.parse::<u64>() {
+                                        cur_drop = df;
+                                    }
+                                }
+                                "frame" => {
+                                    if let Ok(f) = v.parse::<u64>() {
+                                        cur_frame = f;
+                                    }
+                                }
+                                "progress" if v == "continue" => {
+                                    if let Some(ct) = cur_time_ms {
+                                        duration_gauge.set(ct as f64 / 1000.0);
+                                    }
+                                    if cur_dup >= last_dup {
+                                        dup_counter.inc_by(cur_dup - last_dup);
+                                    }
+                                    if cur_drop >= last_drop {
+                                        drop_counter.inc_by(cur_drop - last_drop);
+                                    }
+                                    if cur_frame >= last_frame {
+                                        frame_counter.inc_by(cur_frame - last_frame);
+                                    }
+                                    last_dup = cur_dup;
+                                    last_drop = cur_drop;
+                                    last_frame = cur_frame;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     // Wait for one of: playlist create/modify event, ffmpeg exit (error), or timeout.
     let timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
@@ -725,7 +1006,35 @@ async fn start_ffmpeg_session(state: &AppState, id: usize) -> Result<FfmpegSessi
         dir: Arc::new(dir),
         last_access: Arc::new(RwLock::new(SystemTime::now())),
         child: Arc::new(tokio::sync::Mutex::new(Some(child))),
+        created_at: SystemTime::now(),
+        channel_name: Arc::from(channel_name.to_string()),
     })
+}
+
+async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let metric_families = state.metrics.registry.gather();
+    let mut buf = Vec::new();
+    if let Err(e) = encoder.encode(&metric_families, &mut buf) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("metrics encode error: {e}"),
+        )
+            .into_response();
+    }
+    let body = match String::from_utf8(buf) {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "utf8 error").into_response(),
+    };
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 // Serve the upstream playlist with a fresh token; refresh token on 403 then retry once.
@@ -764,20 +1073,43 @@ async fn channel_upstream_playlist(
     async fn fetch_playlist(
         state: &AppState,
         url_no_auth: &str,
+        metrics_label: &str,
     ) -> reqwest::Result<(StatusCode, String)> {
         let auth_url = build_upstream_url_with_token(url_no_auth, state);
-        match state.client.get(&auth_url).send().await {
+        let start = std::time::Instant::now();
+        let result = match state.client.get(&auth_url).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 let body = resp.text().await.unwrap_or_default();
+                // Increment HTTP response code counter
+                state
+                    .metrics
+                    .upstream_playlist_http_responses_total
+                    .with_label_values(&[metrics_label, &status.as_u16().to_string()])
+                    .inc();
                 Ok((status, body))
             }
             Err(e) => Err(e),
-        }
+        };
+        let elapsed = start.elapsed();
+        state
+            .metrics
+            .upstream_request_duration_ms
+            .with_label_values(&[metrics_label])
+            .observe(elapsed.as_secs_f64() * 1000.0);
+        result
     }
+    // Build label for metrics: full base URL without query params
+    let metrics_label = if let Ok(mut url) = reqwest::Url::parse(&base_url) {
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    } else {
+        base_url.split('?').next().unwrap_or(&base_url).to_string()
+    };
     let mut refreshed = false;
     let body_opt = loop {
-        match fetch_playlist(&state, &base_url).await {
+        match fetch_playlist(&state, &base_url, &metrics_label).await {
             Ok((status, body)) => {
                 if status == StatusCode::FORBIDDEN && !refreshed {
                     warn!(session_id=%id, "Received 403 Forbidden from upstream, attempting token refresh");
@@ -881,6 +1213,8 @@ async fn launch_ffmpeg_child(
         // Allow needed protocols
         .arg("-protocol_whitelist")
         .arg("file,crypto,data,https,http,tcp,tls")
+        // Disable reading from stdin so accidental keystrokes in parent tty don't control ffmpeg
+        .arg("-nostdin")
         // Robust input reconnect flags (best-effort, ignore if older ffmpeg doesn't support some)
         .arg("-reconnect")
         .arg("1")
@@ -908,8 +1242,14 @@ async fn launch_ffmpeg_child(
         .arg("delete_segments+program_date_time+independent_segments")
         .arg("-hls_delete_threshold")
         .arg("1")
+        .arg("-nostats")
+        .arg("-loglevel")
+        .arg("warning")
+        .arg("-progress")
+        .arg("pipe:1")
         .arg(output.to_string_lossy().to_string());
-    cmd.stdout(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn()?;
     // stderr logger
@@ -945,9 +1285,11 @@ async fn refresh_token(state: &AppState) -> Result<String> {
     // Replicate Python API.auth signing for GET v1/ott/token
     let endpoint = "v1/ott/token";
     let (nonce, x_auth) = sign(&state.cookies, endpoint)?;
+    let start = std::time::Instant::now();
     let resp = api_get_builder(&state.client, &state.cookies, endpoint, &nonce, &x_auth)
         .send()
         .await?;
+    let dur = start.elapsed();
     let body = resp.text().await?;
     let TokenResponse { token }: TokenResponse = match serde_json::from_str(&body) {
         Ok(t) => t,
@@ -956,6 +1298,12 @@ async fn refresh_token(state: &AppState) -> Result<String> {
             return Err(anyhow::anyhow!("Token response parse error"));
         }
     };
+    state
+        .metrics
+        .upstream_request_duration_ms
+        .with_label_values(&[endpoint])
+        .observe(dur.as_secs_f64() * 1000.0);
+    state.metrics.token_refresh_total.inc();
     Ok(token)
 }
 
@@ -978,7 +1326,11 @@ fn time30() -> String {
         .as_secs();
     ((now / 30) * 30).to_string()
 }
-async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnection) -> Result<()> {
+async fn ensure_channels_db(
+    cookies: &Cookies,
+    conn: &mut diesel::SqliteConnection,
+    metrics: &Metrics,
+) -> Result<()> {
     if cookies.id.is_empty()
         || cookies.seed.is_empty()
         || cookies
@@ -990,7 +1342,7 @@ async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnecti
         warn!("cookie.json missing id/seed/device.id; skipping channel generation");
         return Ok(());
     }
-    let assets = fetch_assets(cookies).await?;
+    let assets = fetch_assets(cookies, metrics).await?;
     let mut rows: Vec<db::NewChannel> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     for item in assets.0.iter() {
@@ -1021,13 +1373,18 @@ async fn ensure_channels_db(cookies: &Cookies, conn: &mut diesel::SqliteConnecti
     Ok(())
 }
 
-async fn fetch_assets(cookies: &Cookies) -> Result<Assets> {
+async fn fetch_assets(cookies: &Cookies, metrics: &Metrics) -> Result<Assets> {
     let client = Client::builder().gzip(true).deflate(true).build()?;
     let endpoint = "v1/asset";
     let (nonce, x_auth) = sign(cookies, endpoint)?;
+    let start = std::time::Instant::now();
     let resp = api_get_builder(&client, cookies, endpoint, &nonce, &x_auth)
         .send()
         .await?;
+    metrics
+        .upstream_request_duration_ms
+        .with_label_values(&[endpoint])
+        .observe(start.elapsed().as_secs_f64() * 1000.0);
     if !resp.status().is_success() {
         anyhow::bail!("assets fetch failed: {}", resp.status());
     }
@@ -1036,13 +1393,18 @@ async fn fetch_assets(cookies: &Cookies) -> Result<Assets> {
     Ok(v)
 }
 
-async fn fetch_qualities(cookies: &Cookies) -> Result<Qualities> {
+async fn fetch_qualities(cookies: &Cookies, metrics: &Metrics) -> Result<Qualities> {
     let client = Client::builder().gzip(true).deflate(true).build()?;
     let endpoint = "v1/ott/quality";
     let (nonce, x_auth) = sign(cookies, endpoint)?;
+    let start = std::time::Instant::now();
     let resp = api_get_builder(&client, cookies, endpoint, &nonce, &x_auth)
         .send()
         .await?;
+    metrics
+        .upstream_request_duration_ms
+        .with_label_values(&[endpoint])
+        .observe(start.elapsed().as_secs_f64() * 1000.0);
     if !resp.status().is_success() {
         anyhow::bail!("qualities fetch failed: {}", resp.status());
     }
