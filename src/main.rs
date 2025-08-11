@@ -8,7 +8,9 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
+use once_cell::sync::Lazy;
 use parking_lot::RwLock;
+use regex::Regex;
 use reqwest::{
     header::{ACCEPT, USER_AGENT},
     Client,
@@ -301,6 +303,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
         .route("/channel/:id/logo.png", get(get_tvg_logo))
+        .route("/channel/:id/upstream.m3u8", get(channel_upstream_playlist))
         .route("/channel/:id/playlist.m3u8", get(channel_playlist))
         .route("/channel/:id/:segment", get(channel_segment))
         .with_state(state)
@@ -516,35 +519,10 @@ async fn channel_playlist(
 
     info!(channel = %ch.name, "Channel request");
 
-    let mut my_url = ch.url.clone();
-
-    // Log selected quality bitrate if known
-    if let Some(info) = state.qualities.get(state.quality.as_ref()) {
-        info!(selected_quality = %state.quality, bitrate = info.bitrate, label = %info.label, "Serving channel with quality");
-    }
-
-    if let Some(idx) = my_url.find("playlist.m3u8") {
-        // Insert configured quality segment before playlist.m3u8
-        my_url = format!("{}{}/{}", &my_url[..idx], &*state.quality, &my_url[idx..]);
-    }
-
-    // let parsed = Url::parse(&my_url).ok();
-    info!(request_url = %my_url, "Request url");
-
-    // If we don't have a token yet, try to fetch it proactively
-    if state.cookies.id.is_empty() || state.cookies.seed.is_empty() {
-        warn!("cookie.json missing required fields (id/seed)");
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cookie.json missing (id/seed)",
-        )
-            .into_response();
-    }
-
-    // Start or reuse ffmpeg session
+    // Start or reuse ffmpeg session (ffmpeg points at local upstream proxy path now)
     if !state.sessions.contains_key(&id) {
-        info!(session_id=%id, url=%my_url, "Starting new ffmpeg session");
-        match start_ffmpeg_session(&state, id, &my_url).await {
+        info!(session_id=%id, "Starting new ffmpeg session");
+        match start_ffmpeg_session(&state, id).await {
             Ok(sess) => {
                 state.sessions.insert(id, sess);
             }
@@ -657,19 +635,18 @@ fn rewrite_playlist_urls(text: &str, id: usize) -> String {
         .join("\n")
 }
 
-async fn start_ffmpeg_session(
-    state: &AppState,
-    id: usize,
-    base_url_no_auth: &str,
-) -> Result<FfmpegSession> {
+async fn start_ffmpeg_session(state: &AppState, id: usize) -> Result<FfmpegSession> {
     let dir = state.stream_dir.join(format!("ch_{id}"));
     let _ = fs::create_dir_all(&dir);
     // Use ffmpeg copy codecs to just repackage segments locally.
     // Output single variant playlist out.m3u8 with rolling window.
     let output = dir.join("out.m3u8");
-    // Build authenticated upstream URL with current token/hash
-    let upstream_url = build_upstream_url_with_token(base_url_no_auth, state);
-    info!(session_id=%id, url=%upstream_url, dir=?dir, "Starting new ffmpeg session");
+    // Point ffmpeg to local proxy endpoint which will supply a fresh-token playlist each request.
+    let local_upstream = format!(
+        "http://{}:{}/channel/{}/upstream.m3u8",
+        state.host, state.port, id
+    );
+    info!(session_id=%id, url=%local_upstream, dir=?dir, "Starting new ffmpeg session (via local upstream proxy)");
     // Start filesystem watcher BEFORE launching ffmpeg so no events are missed.
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
     let target_name = output
@@ -690,7 +667,7 @@ async fn start_ffmpeg_session(
 
     // Now launch ffmpeg
     let mut child = launch_ffmpeg_child(
-        &upstream_url,
+        &local_upstream,
         &dir,
         id,
         state.hls_segment_duration,
@@ -743,11 +720,140 @@ async fn start_ffmpeg_session(
             }
         }
     }
+
     Ok(FfmpegSession {
         dir: Arc::new(dir),
         last_access: Arc::new(RwLock::new(SystemTime::now())),
         child: Arc::new(tokio::sync::Mutex::new(Some(child))),
     })
+}
+
+// Serve the upstream playlist with a fresh token; refresh token on 403 then retry once.
+async fn channel_upstream_playlist(
+    State(state): State<AppState>,
+    PathParam(id): PathParam<usize>,
+) -> impl IntoResponse {
+    // Load channel info
+    let mut conn = match state.db_pool.get() {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
+    };
+    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    let Some(ch) = row else {
+        return (StatusCode::NOT_FOUND, "Channel not found").into_response();
+    };
+
+    // Build upstream base URL with quality but without token
+    let mut base_url = ch.url.clone();
+
+    // Log selected quality bitrate if known
+    if let Some(info) = state.qualities.get(state.quality.as_ref()) {
+        info!(selected_quality = %state.quality, bitrate = info.bitrate, label = %info.label, "Serving channel with quality");
+    }
+
+    if let Some(idx) = base_url.find("playlist.m3u8") {
+        base_url = format!(
+            "{}{}/{}",
+            &base_url[..idx],
+            &*state.quality,
+            &base_url[idx..]
+        );
+    }
+
+    // Fetch playlist (with token); defined as helper fn
+    async fn fetch_playlist(
+        state: &AppState,
+        url_no_auth: &str,
+    ) -> reqwest::Result<(StatusCode, String)> {
+        let auth_url = build_upstream_url_with_token(url_no_auth, state);
+        match state.client.get(&auth_url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Ok((status, body))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    let mut refreshed = false;
+    let body_opt = loop {
+        match fetch_playlist(&state, &base_url).await {
+            Ok((status, body)) => {
+                if status == StatusCode::FORBIDDEN && !refreshed {
+                    warn!(session_id=%id, "Received 403 Forbidden from upstream, attempting token refresh");
+                    match refresh_token(&state).await {
+                        Ok(t) => *state.token.write() = t,
+                        Err(e) => warn!(error=%e, "Token refresh failed after 403"),
+                    };
+                    refreshed = true; // retry once
+                    continue;
+                }
+                if !status.is_success() {
+                    break None;
+                }
+                break Some(body);
+            }
+            Err(e) => {
+                warn!(error=%e, session_id=%id, "Upstream playlist fetch error");
+                break None;
+            }
+        }
+    };
+    let Some(orig) = body_opt else {
+        return (StatusCode::BAD_GATEWAY, "Upstream fetch failed").into_response();
+    };
+    // Rewrite relative segment URLs to absolute upstream URLs with token/hash each time.
+    let rewritten = rewrite_upstream_playlist_segments(&orig, &base_url);
+    debug!(session_id=%id, rewritten_len=rewritten.len(), "Rewritten upstream playlist ready");
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+            ),
+            (
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store, max-age=0"),
+            ),
+        ],
+        rewritten,
+    )
+        .into_response()
+}
+
+fn rewrite_upstream_playlist_segments(text: &str, base_url_no_auth: &str) -> String {
+    // Rewrite playlist: find EXT-X-KEY line dynamically
+    let parsed = reqwest::Url::parse(base_url_no_auth);
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let key_idx = lines.iter().position(|l| l.starts_with("#EXT-X-KEY:"));
+    let Some(i) = key_idx else {
+        warn!("No #EXT-X-KEY line found");
+        return text.to_owned();
+    };
+    static RE_KEY: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex")
+    });
+    let Some(caps) = RE_KEY.captures(&lines[i]) else {
+        warn!(
+            "#EXT-X-KEY line did not match expected pattern: {}",
+            lines[i]
+        );
+        return text.to_owned();
+    };
+    let uri = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    let iv = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+    let abs_uri = if let Ok(base) = parsed.as_ref() {
+        base.join(uri)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| uri.to_string())
+    } else {
+        uri.to_string()
+    };
+
+    lines[i] = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{abs_uri}\",IV=\"{iv}\"");
+    lines.join("\n")
 }
 
 fn build_upstream_url_with_token(base: &str, state: &AppState) -> String {
@@ -779,8 +885,6 @@ async fn launch_ffmpeg_child(
         .arg("-reconnect")
         .arg("1")
         .arg("-reconnect_streamed")
-        .arg("1")
-        .arg("-reconnect_at_eof")
         .arg("1")
         .arg("-reconnect_on_network_error")
         .arg("1")
