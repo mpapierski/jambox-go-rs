@@ -342,12 +342,16 @@ async fn get_channel(
     //   /{id}/{segment}.ts -> segment served from ffmpeg output dir
     let parts = tail.split('/').collect::<Vec<_>>();
     if parts.len() > 1 {
-        // segment request
+        // segment request - stream file using async file -> Body
         if let Ok(id) = parts[0].parse::<usize>() {
             if let Some(sess) = state.sessions.get(&id) {
                 let seg_name = parts[1];
                 let path = sess.dir.join(seg_name);
-                if let Ok(bytes) = fs::read(&path) {
+                if let Ok(file) = tokio::fs::File::open(&path).await {
+                    use tokio_util::io::ReaderStream;
+                    use axum::body::Body;
+                    let stream = ReaderStream::new(file);
+                    let body = Body::from_stream(stream);
                     sess.touch();
                     return (
                         StatusCode::OK,
@@ -355,7 +359,7 @@ async fn get_channel(
                             axum::http::header::CONTENT_TYPE,
                             axum::http::HeaderValue::from_static("video/mp2t"),
                         )],
-                        bytes,
+                        body,
                     )
                         .into_response();
                 }

@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
@@ -24,3 +24,4 @@ diesel_migrations = { version = "2", features = ["sqlite"] }
 tower-http = { version = "0.5", features = ["cors"] }
 dashmap = "5"
 notify = "6"
+tokio-util = { version = "0.7", features = ["io"] }
