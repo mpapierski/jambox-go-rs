@@ -8,10 +8,7 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
-use http::HeaderValue;
-use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use regex::Regex;
 use reqwest::{
     header::{ACCEPT, USER_AGENT},
     Client,
@@ -36,7 +33,6 @@ use tokio::{
 };
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
-use url::Url;
 // asset schema moved to assets.rs
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -442,7 +438,7 @@ async fn get_channel(
             match fs::read_to_string(&playlist_path) {
                 Ok(text) => {
                     let rewritten = rewrite_playlist_urls(&text, id);
-                    return (
+                    (
                         StatusCode::OK,
                         [(
                             axum::http::header::CONTENT_TYPE,
@@ -450,18 +446,17 @@ async fn get_channel(
                         )],
                         rewritten,
                     )
-                        .into_response();
+                        .into_response()
                 }
                 Err(e) => {
                     warn!(error=%e, ?playlist_path, "Failed to read ffmpeg playlist; falling back to upstream rewrite");
-                    return (StatusCode::SERVICE_UNAVAILABLE, "service not available")
-                        .into_response();
+                    (StatusCode::SERVICE_UNAVAILABLE, "service not available").into_response()
                 }
             }
         }
         None => {
             warn!(session_id=%id, "FFmpeg session not found");
-            return (StatusCode::SERVICE_UNAVAILABLE, "service not available").into_response();
+            (StatusCode::SERVICE_UNAVAILABLE, "service not available").into_response()
         }
     }
 }
@@ -570,11 +565,11 @@ async fn start_ffmpeg_session(
                 // Only proceed if event is Create/Modify referencing out.m3u8
                 let is_relevant_kind = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
                 debug!(session_id=%id, ?event, "Received file system event: {:?}", event);
-                if is_relevant_kind {
-                    if event.paths.iter().any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false)) {
-                        info!(session_id=%id, "FFmpeg session started successfully");
-                        break; // success
-                    }
+                if is_relevant_kind
+                    && event.paths.iter().any(|p| p.file_name().map(|n| n == target_name).unwrap_or(false))
+                {
+                    info!(session_id=%id, "FFmpeg session started successfully");
+                    break; // success
                 }
                 // otherwise keep waiting
             }
