@@ -20,6 +20,7 @@ mod schema;
 use assets::{AssetUrlField, Assets};
 use dashmap::DashMap;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
+
 use std::{
     collections::HashSet,
     fs,
@@ -453,25 +454,12 @@ async fn get_channel(
             .into_response();
     }
 
-    // Build full upstream URL (with token/hash) for ffmpeg direct ingestion instead of local file
-    let ffmpeg_playlist_url = {
-        if let Ok(mut u) = reqwest::Url::parse(&my_url) {
-            let token_now = state.token.read().clone();
-            u.query_pairs_mut()
-                .append_pair("token", &token_now)
-                .append_pair("hash", &state.cookies.id);
-            u.to_string()
-        } else {
-            my_url.clone()
-        }
-    };
-
     // Start or reuse ffmpeg session
     if !state.sessions.contains_key(&id) {
-        info!(session_id=%id, url=%ffmpeg_playlist_url, "Starting new ffmpeg session");
-        match start_ffmpeg_session(&state, id, &ffmpeg_playlist_url).await {
+        info!(session_id=%id, url=%my_url, "Starting new ffmpeg session");
+        match start_ffmpeg_session(&state, id, &my_url).await {
             Ok(sess) => {
-                info!(session_id=%id, url=%ffmpeg_playlist_url, "FFmpeg session started");
+                info!(session_id=%id, url=%my_url, "FFmpeg session started");
                 state.sessions.insert(id, sess);
             }
             Err(e) => {
@@ -511,10 +499,11 @@ async fn get_channel(
 }
 
 fn rewrite_playlist_urls(text: &str, id: usize) -> String {
+    // Just rewrite segment paths to local relative URLs for this channel id.
     let base = format!("/{id}/");
     text.lines()
         .map(|l| {
-            if l.starts_with("#") || l.trim().is_empty() {
+            if l.starts_with('#') || l.trim().is_empty() {
                 l.to_string()
             } else if l.ends_with(".ts") {
                 format!("{base}{l}")
@@ -529,13 +518,15 @@ fn rewrite_playlist_urls(text: &str, id: usize) -> String {
 async fn start_ffmpeg_session(
     state: &AppState,
     id: usize,
-    upstream_url: &str,
+    base_url_no_auth: &str,
 ) -> Result<FfmpegSession> {
     let dir = state.stream_dir.join(format!("ch_{id}"));
     let _ = fs::create_dir_all(&dir);
     // Use ffmpeg copy codecs to just repackage segments locally.
     // Output single variant playlist out.m3u8 with rolling window.
     let output = dir.join("out.m3u8");
+    // Build authenticated upstream URL with current token/hash
+    let upstream_url = build_upstream_url_with_token(base_url_no_auth, state);
     info!(session_id=%id, url=%upstream_url, dir=?dir, "Starting new ffmpeg session");
     // Start filesystem watcher BEFORE launching ffmpeg so no events are missed.
     let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -556,28 +547,7 @@ async fn start_ffmpeg_session(
     });
 
     // Now launch ffmpeg
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-protocol_whitelist")
-        .arg("file,crypto,data,https,http,tcp,tls")
-        .arg("-allowed_extensions")
-        .arg("ALL")
-        .arg("-i")
-        .arg(upstream_url)
-        .arg("-c")
-        .arg("copy")
-        .arg("-f")
-        .arg("hls")
-        .arg("-hls_time")
-        .arg("4")
-        .arg("-hls_list_size")
-        .arg("6")
-        .arg("-hls_flags")
-        .arg("delete_segments+program_date_time")
-        .arg(output.to_string_lossy().to_string());
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let mut child = launch_ffmpeg_child(&upstream_url, &dir, id).await?;
     // Spawn a task to log stderr (non-blocking)
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
@@ -629,6 +599,81 @@ async fn start_ffmpeg_session(
         last_access: Arc::new(RwLock::new(SystemTime::now())),
         child: Arc::new(tokio::sync::Mutex::new(Some(child))),
     })
+}
+
+fn build_upstream_url_with_token(base: &str, state: &AppState) -> String {
+    if let Ok(mut u) = reqwest::Url::parse(base) {
+        let token_now = state.token.read().clone();
+        u.query_pairs_mut()
+            .append_pair("token", &token_now)
+            .append_pair("hash", &state.cookies.id);
+        u.to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+async fn launch_ffmpeg_child(
+    upstream_url: &str,
+    dir: &Path,
+    id: usize,
+) -> Result<tokio::process::Child> {
+    let output = dir.join("out.m3u8");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        // Allow needed protocols
+        .arg("-protocol_whitelist")
+        .arg("file,crypto,data,https,http,tcp,tls")
+        // Robust input reconnect flags (best-effort, ignore if older ffmpeg doesn't support some)
+        .arg("-reconnect")
+        .arg("1")
+        .arg("-reconnect_streamed")
+        .arg("1")
+        .arg("-reconnect_at_eof")
+        .arg("1")
+        .arg("-reconnect_on_network_error")
+        .arg("1")
+        .arg("-reconnect_delay_max")
+        .arg("2")
+        .arg("-allowed_extensions")
+        .arg("ALL")
+        .arg("-i")
+        .arg(upstream_url)
+        .arg("-hls_segment_filename")
+        .arg(dir.join("seg_%d.ts").to_string_lossy().to_string())
+        .arg("-c")
+        .arg("copy")
+        .arg("-f")
+        .arg("hls")
+        .arg("-hls_time")
+        .arg("4")
+        .arg("-hls_list_size")
+        .arg("6")
+        .arg("-hls_flags")
+        .arg("delete_segments+program_date_time")
+        .arg(output.to_string_lossy().to_string());
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // stderr logger
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                let msg = line.trim_end();
+                if !msg.is_empty() {
+                    tracing::info!(target = "ffmpeg", "{msg}");
+                }
+                line.clear();
+            }
+        });
+    }
+    info!(session_id=%id, url=%upstream_url, "launched ffmpeg child");
+    Ok(child)
 }
 
 #[derive(Debug, Deserialize)]
