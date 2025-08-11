@@ -21,12 +21,17 @@ mod assets;
 mod db;
 mod schema;
 use assets::{AssetUrlField, Assets};
+use dashmap::DashMap;
 use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
@@ -82,6 +87,9 @@ struct Cli {
     /// Stream quality segment to inject before playlist.m3u8 (env: JAMBOX_QUALITY)
     #[arg(long, env = "JAMBOX_QUALITY", default_value = "high")]
     quality: String,
+    /// Directory to store on-demand repackaged HLS sessions (env: JAMBOX_STREAM_DIR, default: system temp + jambox_streams)
+    #[arg(long, env = "JAMBOX_STREAM_DIR")]
+    stream_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -100,6 +108,20 @@ struct AppState {
     port: u16,
     quality: Arc<str>,
     qualities: Arc<Qualities>,
+    sessions: Arc<DashMap<usize, FfmpegSession>>, // channel id -> session
+    stream_dir: Arc<PathBuf>,                     // root directory for ffmpeg session dirs
+}
+
+#[derive(Clone)]
+struct FfmpegSession {
+    dir: Arc<PathBuf>,                    // directory with playlist + segments
+    last_access: Arc<RwLock<SystemTime>>, // for GC
+}
+
+impl FfmpegSession {
+    fn touch(&self) {
+        *self.last_access.write() = SystemTime::now();
+    }
 }
 
 #[tokio::main]
@@ -184,6 +206,15 @@ async fn main() -> Result<()> {
         info!(count = names.len(), keys = %names.join(","), "Fetched qualities");
     }
 
+    // Determine stream root directory
+    let stream_root = cli
+        .stream_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("jambox_streams"));
+    if let Err(e) = fs::create_dir_all(&stream_root) {
+        warn!(error=%e, ?stream_root, "Failed to create stream dir");
+    }
+
     let state = AppState {
         client: Client::builder().gzip(true).deflate(true).build()?,
         cookies: Arc::new(cookies),
@@ -193,6 +224,8 @@ async fn main() -> Result<()> {
         port: cli.port,
         quality: cli.quality.into(),
         qualities: Arc::new(qualities),
+        sessions: Arc::new(DashMap::new()),
+        stream_dir: Arc::new(stream_root),
     };
 
     match refresh_token(&state).await {
@@ -306,7 +339,35 @@ async fn get_channel(
     State(state): State<AppState>,
     PathParam(tail): PathParam<String>,
 ) -> impl IntoResponse {
-    let id_str = tail.strip_suffix(".m3u8").unwrap_or(&tail);
+    // Support both on-demand ffmpeg proxied HLS and direct playlist rewriting.
+    // Paths we accept:
+    //   /{id}.m3u8 -> master playlist proxied (ffmpeg) or rewritten upstream
+    //   /{id}/{segment}.ts -> segment served from ffmpeg output dir
+    let parts = tail.split('/').collect::<Vec<_>>();
+    if parts.len() > 1 {
+        // segment request
+        if let Ok(id) = parts[0].parse::<usize>() {
+            if let Some(sess) = state.sessions.get(&id) {
+                let seg_name = parts[1];
+                let path = sess.dir.join(seg_name);
+                if let Ok(bytes) = fs::read(&path) {
+                    sess.touch();
+                    return (
+                        StatusCode::OK,
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static("video/mp2t"),
+                        )],
+                        bytes,
+                    )
+                        .into_response();
+                }
+            }
+        }
+        return (StatusCode::NOT_FOUND, "Segment not found").into_response();
+    }
+
+    let id_str = parts[0].strip_suffix(".m3u8").unwrap_or(parts[0]);
     let Ok(id) = id_str.parse::<usize>() else {
         return (StatusCode::NOT_FOUND, "Invalid id").into_response();
     };
@@ -443,62 +504,179 @@ async fn get_channel(
     .await;
 
     let content = match content {
-        Ok(c) => {
-            info!("Channel content fetched successfully");
-            c
-        }
+        Ok(c) => c,
         Err(e) => {
             warn!("Channel fetch failed: {}", e);
             return (StatusCode::BAD_GATEWAY, "Channel fetch failed").into_response();
         }
     };
-
-    // Rewrite playlist: find EXT-X-KEY line dynamically
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    let key_idx = lines.iter().position(|l| l.starts_with("#EXT-X-KEY:"));
-    let Some(i) = key_idx else {
-        warn!("No #EXT-X-KEY line found");
-        return (StatusCode::BAD_GATEWAY, "Key line not found").into_response();
-    };
-    static RE_KEY: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex")
-    });
-    let Some(caps) = RE_KEY.captures(&lines[i]) else {
-        warn!(
-            "#EXT-X-KEY line did not match expected pattern: {}",
-            lines[i]
-        );
-        return (StatusCode::BAD_GATEWAY, "Key parse error").into_response();
-    };
-    let uri = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-    let iv = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-    let abs_uri = if let Some(base) = parsed.as_ref() {
-        base.join(uri)
-            .map(|u| u.to_string())
-            .unwrap_or_else(|_| uri.to_string())
-    } else {
-        uri.to_string()
+    let out = rewrite_key_line(content, parsed.as_ref());
+    // Build full upstream URL (with token/hash) for ffmpeg direct ingestion instead of local file
+    let ffmpeg_playlist_url = {
+        if let Ok(mut u) = reqwest::Url::parse(&my_url) {
+            let token_now = state.token.read().clone();
+            u.query_pairs_mut()
+                .append_pair("token", &token_now)
+                .append_pair("hash", &state.cookies.id);
+            u.to_string()
+        } else {
+            my_url.clone()
+        }
     };
 
-    lines[i] = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{abs_uri}\",IV=\"{iv}\"");
-    let out = lines.join("\n");
+    // Start or reuse ffmpeg session
+    if !state.sessions.contains_key(&id) {
+        info!(session_id=%id, url=%ffmpeg_playlist_url, "Starting new ffmpeg session");
+        match start_ffmpeg_session(&state, id, &ffmpeg_playlist_url).await {
+            Ok(sess) => {
+                info!(session_id=%id, url=%ffmpeg_playlist_url, "FFmpeg session started");
+                state.sessions.insert(id, sess);
+            }
+            Err(e) => {
+                warn!(error=%e, "Failed to start ffmpeg session; falling back to direct rewrite");
+            }
+        }
+    }
+
+    if let Some(sess) = state.sessions.get(&id) {
+        sess.touch();
+        let playlist_path = sess.dir.join("out.m3u8");
+        match fs::read_to_string(&playlist_path) {
+            Ok(text) => {
+                let rewritten = rewrite_playlist_urls(&text, id);
+                return (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                    )],
+                    rewritten,
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                warn!(error=%e, ?playlist_path, "Failed to read ffmpeg playlist; falling back to upstream rewrite");
+            }
+        }
+    }
 
     (
         StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-            ),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                axum::http::HeaderValue::from_static("attachment; filename=playlist.m3u8"),
-            ),
-        ],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
+        )],
         out,
     )
         .into_response()
+}
+
+fn rewrite_playlist_urls(text: &str, id: usize) -> String {
+    let base = format!("/{id}/");
+    text.lines()
+        .map(|l| {
+            if l.starts_with("#") || l.trim().is_empty() {
+                l.to_string()
+            } else if l.ends_with(".ts") {
+                format!("{base}{l}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rewrite_key_line(content: String, parsed: Option<&Url>) -> String {
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    let key_idx = lines.iter().position(|l| l.starts_with("#EXT-X-KEY:"));
+    if let Some(i) = key_idx {
+        static RE_KEY: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex")
+        });
+        if let Some(caps) = RE_KEY.captures(&lines[i]) {
+            let uri = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let iv = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            let abs_uri = if let Some(base) = parsed {
+                base.join(uri)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| uri.to_string())
+            } else {
+                uri.to_string()
+            };
+            lines[i] = format!("#EXT-X-KEY:METHOD=AES-128,URI=\"{abs_uri}\",IV=\"{iv}\"");
+        }
+    }
+    lines.join("\n")
+}
+
+async fn start_ffmpeg_session(
+    state: &AppState,
+    id: usize,
+    upstream_url: &str,
+) -> Result<FfmpegSession> {
+    let dir = state.stream_dir.join(format!("ch_{id}"));
+    let _ = fs::create_dir_all(&dir);
+    // Use ffmpeg copy codecs to just repackage segments locally.
+    // Output single variant playlist out.m3u8 with rolling window.
+    let output = dir.join("out.m3u8");
+    info!(session_id=%id, url=%upstream_url, dir=?dir, "Starting new ffmpeg session");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-y")
+        .arg("-protocol_whitelist")
+        .arg("file,crypto,data,https,http,tcp,tls")
+        .arg("-allowed_extensions")
+        .arg("ALL")
+        .arg("-i")
+        .arg(upstream_url)
+        .arg("-c")
+        .arg("copy")
+        .arg("-f")
+        .arg("hls")
+        .arg("-hls_time")
+        .arg("4")
+        .arg("-hls_list_size")
+        .arg("6")
+        .arg("-hls_flags")
+        .arg("delete_segments+program_date_time")
+        .arg(output.to_string_lossy().to_string());
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn()?;
+    // Spawn a task to log stderr (non-blocking)
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 {
+                    break;
+                }
+                let msg = line.trim_end();
+                if !msg.is_empty() {
+                    tracing::info!(target = "ffmpeg", "{msg}");
+                }
+                line.clear();
+            }
+        });
+    }
+    // Wait for playlist to appear (retry quick a few times)
+    for _ in 0..8 {
+        if output.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if !output.exists() {
+        return Err(anyhow!(
+            "ffmpeg failed: playlist not created: {}",
+            output.display()
+        ));
+    }
+    Ok(FfmpegSession {
+        dir: Arc::new(dir),
+        last_access: Arc::new(RwLock::new(SystemTime::now())),
+    })
 }
 
 #[derive(Debug, Deserialize)]

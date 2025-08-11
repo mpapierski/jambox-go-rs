@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
@@ -32,3 +32,4 @@ diesel_migrations = { version = "2", features = ["sqlite"] }
 r2d2 = "0.8"
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 tower-http = { version = "0.5", features = ["cors"] }
+dashmap = "5"
