@@ -91,6 +91,12 @@ struct Cli {
     /// Idle seconds before an ffmpeg session is garbage collected (env: JAMBOX_SESSION_IDLE_SECS)
     #[arg(long, env = "JAMBOX_SESSION_IDLE_SECS", default_value_t = 180)]
     session_idle_secs: u64,
+    /// Target HLS segment duration in seconds (env: JAMBOX_HLS_SEGMENT_DURATION)
+    #[arg(long, env = "JAMBOX_HLS_SEGMENT_DURATION", default_value_t = 4)]
+    hls_segment_duration: u32,
+    /// HLS playlist size (number of media segments retained) (env: JAMBOX_HLS_PLAYLIST_SIZE)
+    #[arg(long, env = "JAMBOX_HLS_PLAYLIST_SIZE", default_value_t = 6)]
+    hls_playlist_size: u32,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -112,6 +118,8 @@ struct AppState {
     sessions: Arc<DashMap<usize, FfmpegSession>>, // channel id -> session
     stream_dir: Arc<PathBuf>,                     // root directory for ffmpeg session dirs
     session_idle: Duration,                       // idle timeout
+    hls_segment_duration: u32,
+    hls_playlist_size: u32,
 }
 
 #[derive(Clone)]
@@ -230,6 +238,8 @@ async fn main() -> Result<()> {
         sessions: Arc::new(DashMap::new()),
         stream_dir: Arc::new(stream_root),
         session_idle: Duration::from_secs(cli.session_idle_secs),
+        hls_segment_duration: cli.hls_segment_duration,
+        hls_playlist_size: cli.hls_playlist_size,
     };
 
     // Spawn background GC task for idle ffmpeg sessions
@@ -289,8 +299,8 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/playlist.m3u", get(get_playlist))
         .route("/epg", get(get_epg))
-        .route("/tvg-logo/:id", get(get_tvg_logo))
-        .route("/*tail", get(get_channel))
+        .route("/channel/:id/playlist.m3u8", get(channel_playlist))
+        .route("/channel/:id/:segment", get(channel_segment))
         .with_state(state)
         .layer(cors);
 
@@ -326,7 +336,7 @@ async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
             idx, ch.name, idx, ch.name
         ));
         out.push_str(&format!(
-            "http://{}:{}/{idx}.m3u8\n",
+            "http://{}:{}/channel/{idx}/playlist.m3u8\n",
             state.host, state.port
         ));
     }
@@ -459,11 +469,10 @@ async fn get_channel(
         info!(session_id=%id, url=%my_url, "Starting new ffmpeg session");
         match start_ffmpeg_session(&state, id, &my_url).await {
             Ok(sess) => {
-                info!(session_id=%id, url=%my_url, "FFmpeg session started");
                 state.sessions.insert(id, sess);
             }
             Err(e) => {
-                warn!(error=%e, "Failed to start ffmpeg session; falling back to direct rewrite");
+                warn!(error=%e, "Failed to start ffmpeg session");
             }
         }
     }
@@ -477,10 +486,26 @@ async fn get_channel(
                     let rewritten = rewrite_playlist_urls(&text, id);
                     (
                         StatusCode::OK,
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            axum::http::HeaderValue::from_static("application/vnd.apple.mpegurl"),
-                        )],
+                        [
+                            (
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static(
+                                    "application/vnd.apple.mpegurl",
+                                ),
+                            ),
+                            (
+                                axum::http::header::CACHE_CONTROL,
+                                axum::http::HeaderValue::from_static("no-store, max-age=0"),
+                            ),
+                            (
+                                axum::http::header::PRAGMA,
+                                axum::http::HeaderValue::from_static("no-cache"),
+                            ),
+                            (
+                                axum::http::header::EXPIRES,
+                                axum::http::HeaderValue::from_static("0"),
+                            ),
+                        ],
                         rewritten,
                     )
                         .into_response()
@@ -498,9 +523,49 @@ async fn get_channel(
     }
 }
 
+async fn channel_segment(
+    State(state): State<AppState>,
+    PathParam((id, segment)): PathParam<(usize, String)>,
+) -> impl IntoResponse {
+    if let Some(sess) = state.sessions.get(&id) {
+        let path = sess.dir.join(&segment);
+        if let Ok(file) = tokio::fs::File::open(&path).await {
+            use axum::body::Body;
+            use tokio_util::io::ReaderStream;
+            let stream = ReaderStream::new(file);
+            let body = Body::from_stream(stream);
+            sess.touch();
+            return (
+                StatusCode::OK,
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("video/mp2t"),
+                    ),
+                    (
+                        axum::http::header::CACHE_CONTROL,
+                        axum::http::HeaderValue::from_static("no-store, max-age=0"),
+                    ),
+                    (
+                        axum::http::header::PRAGMA,
+                        axum::http::HeaderValue::from_static("no-cache"),
+                    ),
+                    (
+                        axum::http::header::EXPIRES,
+                        axum::http::HeaderValue::from_static("0"),
+                    ),
+                ],
+                body,
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::NOT_FOUND, "Segment not found").into_response()
+}
+
 fn rewrite_playlist_urls(text: &str, id: usize) -> String {
-    // Just rewrite segment paths to local relative URLs for this channel id.
-    let base = format!("/{id}/");
+    // Rewrite segment paths to /channel/{id}/<segment>
+    let base = format!("/channel/{id}/");
     text.lines()
         .map(|l| {
             if l.starts_with('#') || l.trim().is_empty() {
@@ -547,7 +612,14 @@ async fn start_ffmpeg_session(
     });
 
     // Now launch ffmpeg
-    let mut child = launch_ffmpeg_child(&upstream_url, &dir, id).await?;
+    let mut child = launch_ffmpeg_child(
+        &upstream_url,
+        &dir,
+        id,
+        state.hls_segment_duration,
+        state.hls_playlist_size,
+    )
+    .await?;
     // Spawn a task to log stderr (non-blocking)
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(async move {
@@ -617,6 +689,8 @@ async fn launch_ffmpeg_child(
     upstream_url: &str,
     dir: &Path,
     id: usize,
+    seg_duration: u32,
+    playlist_size: u32,
 ) -> Result<tokio::process::Child> {
     let output = dir.join("out.m3u8");
     let mut cmd = Command::new("ffmpeg");
@@ -646,11 +720,13 @@ async fn launch_ffmpeg_child(
         .arg("-f")
         .arg("hls")
         .arg("-hls_time")
-        .arg("4")
+        .arg(seg_duration.to_string())
         .arg("-hls_list_size")
-        .arg("6")
+        .arg(playlist_size.to_string())
         .arg("-hls_flags")
-        .arg("delete_segments+program_date_time")
+        .arg("delete_segments+program_date_time+independent_segments")
+        .arg("-hls_delete_threshold")
+        .arg("1")
         .arg(output.to_string_lossy().to_string());
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
