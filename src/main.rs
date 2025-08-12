@@ -22,7 +22,6 @@ mod schema;
 use assets::{AssetUrlField, Assets};
 use dashmap::DashMap;
 use notify::{recommended_watcher, EventKind, RecursiveMode, Watcher};
-
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     Opts, Registry, TextEncoder,
@@ -35,7 +34,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::Command,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -137,11 +136,44 @@ struct FfmpegSession {
     child: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>, // ffmpeg process
     created_at: SystemTime,               // for duration metric
     channel_name: Arc<str>,
+    stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>, // to send 'q' on shutdown
 }
 
 impl FfmpegSession {
     fn touch(&self) {
         *self.last_access.write() = SystemTime::now();
+    }
+
+    /// Ask ffmpeg to quit cleanly by sending 'q' on stdin, then wait up to `timeout` before killing.
+    async fn send_quit_and_wait(&self, id: usize, timeout: Duration) {
+        // Try 'q' on stdin first
+        if let Some(mut stdin) = self.stdin.lock().await.take() {
+            let _ = stdin.write_all(b"q\n").await;
+            let _ = stdin.flush().await;
+            let _ = stdin.shutdown().await;
+        }
+
+        // Then wait for the process to exit
+        if let Some(mut child) = self.child.lock().await.take() {
+            match tokio::time::timeout(timeout, child.wait()).await {
+                Ok(Ok(status)) => {
+                    tracing::info!(session_id=%id, ?status, "ffmpeg exited cleanly after 'q'");
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(session_id=%id, error=%e, "ffmpeg wait error after 'q'");
+                }
+                Err(_) => {
+                    tracing::warn!(session_id=%id, "ffmpeg did not exit after 'q', killing");
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                }
+            }
+        }
+
+        // Remove directory
+        if let Err(e) = fs::remove_dir_all(&*self.dir) {
+            warn!(session_id=%id, error=%e, dir=?self.dir, "Failed to remove session dir");
+        }
     }
 }
 
@@ -447,17 +479,8 @@ async fn main() -> Result<()> {
                 }
                 for id in to_remove {
                     if let Some((_, sess)) = state_gc.sessions.remove(&id) {
-                        // Kill process
-                        if let Some(mut child) = sess.child.lock().await.take() {
-                            if let Err(e) = child.kill().await {
-                                warn!(session_id=%id, error=%e, "Failed to kill ffmpeg child (maybe already exited)");
-                            }
-                            let _ = child.wait().await;
-                        }
-                        // Remove directory
-                        if let Err(e) = fs::remove_dir_all(&*sess.dir) {
-                            warn!(session_id=%id, error=%e, dir=?sess.dir, "Failed to remove session dir");
-                        }
+                        // Request clean quit and wait up to 10 seconds
+                        sess.send_quit_and_wait(id, Duration::from_secs(10)).await;
                         // Remove per-session metric labels
                         let labels = [&id.to_string(), sess.channel_name.as_ref()];
                         let _ = state_gc
@@ -508,7 +531,7 @@ async fn main() -> Result<()> {
         .route("/channel/:id/upstream.m3u8", get(channel_upstream_playlist))
         .route("/channel/:id/playlist.m3u8", get(channel_playlist))
         .route("/channel/:id/:segment", get(channel_segment))
-        .with_state(state)
+        .with_state(state.clone())
         .layer(cors);
 
     info!(%addr, "Starting server");
@@ -519,7 +542,51 @@ async fn main() -> Result<()> {
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", cli.port)).await?
         }
     };
-    axum::serve(listener, app).await?;
+    // Graceful shutdown setup: listen for Ctrl+C and SIGTERM
+    use tokio::signal;
+    let state_for_shutdown = state.clone();
+    let shutdown_signal = async move {
+        // Ctrl+C
+        let ctrl_c = async {
+            let _ = signal::ctrl_c().await;
+        };
+        // SIGTERM (unix only); ignore error on non-unix builds
+        #[cfg(unix)]
+        let terminate = async {
+            use tokio::signal::unix::{signal, SignalKind};
+            if let Ok(mut stream) = signal(SignalKind::terminate()) {
+                let _ = stream.recv().await;
+            }
+        };
+        #[cfg(not(unix))]
+        let terminate = std::future::pending::<()>();
+        tokio::select! { _ = ctrl_c => {}, _ = terminate => {} }
+        // Collect IDs first to avoid holding iter guard during awaits
+        let ids: Vec<usize> = state_for_shutdown
+            .sessions
+            .iter()
+            .map(|e| *e.key())
+            .collect();
+        // Begin shutdown: stop ffmpeg sessions
+        tracing::info!(
+            ids = ids.len(),
+            "Shutdown signal received; terminating ffmpeg sessions"
+        );
+
+        for id in ids {
+            if let Some(entry) = state_for_shutdown.sessions.get(&id) {
+                tracing::info!(session_id=%id, channel=%entry.channel_name, "Stopping ffmpeg session");
+                entry
+                    .send_quit_and_wait(id, std::time::Duration::from_secs(10))
+                    .await;
+            }
+            // Remove after stopping
+            state_for_shutdown.sessions.remove(&id);
+        }
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }
 
@@ -888,16 +955,19 @@ async fn start_ffmpeg_session(
             let mut line = String::new();
             while let Ok(n) = reader.read_line(&mut line).await {
                 if n == 0 {
+                    debug!(target = "ffmpeg_stderr", "ffmpeg stderr closed");
                     break;
                 }
                 let msg = line.trim_end();
                 if !msg.is_empty() {
-                    tracing::info!(target = "ffmpeg_stderr", "{msg}");
+                    debug!(target = "ffmpeg_stderr", "{msg}");
                 }
                 line.clear();
             }
         });
     }
+    // Take stdin so we can send 'q' for graceful quit later
+    let mut stdin_for_session = child.stdin.take();
     // Spawn progress reader (stdout, -progress pipe:1)
     if let Some(stdout) = child.stdout.take() {
         let labels = [&id.to_string(), channel_name];
@@ -1008,6 +1078,7 @@ async fn start_ffmpeg_session(
         child: Arc::new(tokio::sync::Mutex::new(Some(child))),
         created_at: SystemTime::now(),
         channel_name: Arc::from(channel_name.to_string()),
+        stdin: Arc::new(tokio::sync::Mutex::new(stdin_for_session.take())),
     })
 }
 
@@ -1213,8 +1284,7 @@ async fn launch_ffmpeg_child(
         // Allow needed protocols
         .arg("-protocol_whitelist")
         .arg("file,crypto,data,https,http,tcp,tls")
-        // Disable reading from stdin so accidental keystrokes in parent tty don't control ffmpeg
-        .arg("-nostdin")
+        // We'll attach a dedicated stdin pipe to allow sending 'q' on shutdown
         // Robust input reconnect flags (best-effort, ignore if older ffmpeg doesn't support some)
         .arg("-reconnect")
         .arg("1")
@@ -1248,24 +1318,30 @@ async fn launch_ffmpeg_child(
         .arg("-progress")
         .arg("pipe:1")
         .arg(output.to_string_lossy().to_string());
-    cmd.stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
     let mut child = cmd.spawn()?;
+
     // stderr logger
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            while let Ok(n) = reader.read_line(&mut line).await {
-                if n == 0 {
-                    break;
+        tokio::spawn({
+            let upstream_url = upstream_url.to_owned();
+            async move {
+                let mut reader = BufReader::new(stderr);
+                let mut line = String::new();
+                while let Ok(n) = reader.read_line(&mut line).await {
+                    if n == 0 {
+                        info!(target = "ffmpeg_stderr", session_id=%id, url=%upstream_url, %id, "ffmpeg stderr closed");
+                        break;
+                    }
+                    let msg = line.trim_end();
+                    if !msg.is_empty() {
+                        tracing::info!(target = "ffmpeg_stderr", session_id=%id, url=%upstream_url, %id, "{msg}");
+                    }
+                    line.clear();
                 }
-                let msg = line.trim_end();
-                if !msg.is_empty() {
-                    tracing::info!(target = "ffmpeg", "{msg}");
-                }
-                line.clear();
             }
         });
     }
