@@ -134,7 +134,6 @@ Uses `tracing` with env filter (set `RUST_LOG=debug` for verbose). FFmpeg stderr
 
 * No CMAF Low-Latency HLS (partial segments) yet.
 * No per-user authorization or rate limiting.
-* No metrics endpoint (could expose channel/session counts, ffmpeg health).
 * Possible enhancement: segment caching across viewers of same channel (already reused by shared session).
 
 ## Development
@@ -155,3 +154,61 @@ Original concept and API reverse engineering inspiration from: https://github.co
 ## License
 
 See project root (if not specified, treat as all-rights-reserved until a license is added). Add a suitable open-source license if you intend to distribute.
+
+## Metrics
+
+This service exposes a Prometheus-compatible metrics endpoint at:
+
+- GET `/metrics` – Content-Type: `text/plain; version=0.0.4`
+
+Scrape example (Prometheus):
+
+```yaml
+scrape_configs:
+	- job_name: jambox-go
+		static_configs:
+			- targets: ["<host>:8098"]
+		metrics_path: /metrics
+```
+
+Exported metrics
+
+- jambox_active_sessions (gauge)
+	- Description: Number of currently active ffmpeg sessions
+- jambox_sessions_created_total (counter)
+	- Description: Total number of ffmpeg sessions ever created
+- jambox_sessions_removed_total (counter)
+	- Description: Total number of ffmpeg sessions removed
+- jambox_session_lifetime_seconds (histogram)
+	- Description: Lifetime of ffmpeg sessions in seconds (recorded when session ends)
+	- Buckets: [1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600]
+- jambox_session_duration_seconds{channel_id, channel_name} (gauge)
+	- Description: Real-time current streaming duration per active session (from ffmpeg `out_time_ms`)
+- jambox_session_dup_frames_total{channel_id, channel_name} (counter)
+	- Description: Total duplicate frames reported by ffmpeg (from `dup_frames`)
+- jambox_session_drop_frames_total{channel_id, channel_name} (counter)
+	- Description: Total dropped frames reported by ffmpeg (from `drop_frames`)
+- jambox_session_frames_total{channel_id, channel_name} (counter)
+	- Description: Total frames processed (from ffmpeg `frame`)
+- jambox_token_refresh_total (counter)
+	- Description: Total number of successful token refresh operations
+- jambox_upstream_request_duration_milliseconds{endpoint} (histogram)
+	- Description: Upstream API request latency in milliseconds (label is API endpoint or base playlist URL)
+	- Buckets: [5, 10, 25, 50, 75, 100, 150, 250, 400, 600, 800, 1000, 1500, 2000, 3000, 5000, 8000, 12000]
+- jambox_upstream_playlist_http_responses_total{url, status_code} (counter)
+	- Description: Count of upstream playlist HTTP responses by base URL and status code
+
+Notes
+
+- Per-session series (with channel_id/channel_name) are removed on session GC/exit to avoid stale labels.
+- The legacy bitrate gauge is defined but not updated in copy/remux mode; consider removing or repurposing.
+
+Example Queries
+
+- Active sessions: `jambox_active_sessions`
+- Total sessions created/removed: `increase(jambox_sessions_created_total[24h])`, `increase(jambox_sessions_removed_total[24h])`
+- Current live durations by channel: `jambox_session_duration_seconds`
+- Dup/drop frames rate: `rate(jambox_session_dup_frames_total[5m])`, `rate(jambox_session_drop_frames_total[5m])`
+- Token refresh rate: `rate(jambox_token_refresh_total[15m])`
+- Upstream API p95 (ms): `histogram_quantile(0.95, sum by (le, endpoint) (rate(jambox_upstream_request_duration_milliseconds_bucket[5m])))`
+- Playlist HTTP response mix per URL: `sum by (url, status_code) (increase(jambox_upstream_playlist_http_responses_total[1h]))`
