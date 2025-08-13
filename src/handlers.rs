@@ -6,7 +6,12 @@ use axum::{
     Router,
 };
 use std::{path::PathBuf, sync::Arc};
-use tower_http::cors::{Any, CorsLayer};
+// bring oneshot() into scope for ServeDir
+use tower::ServiceExt;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    services::ServeDir,
+};
 use tracing::{debug, info, warn};
 
 use crate::domain::Cookies;
@@ -308,38 +313,46 @@ async fn channel_segment(
     State(state): State<AppState>,
     PathParam((id, segment)): PathParam<(usize, String)>,
 ) -> impl IntoResponse {
+    use axum::body::Body;
+    use axum::http::{Request, Uri};
+
+    // basic path validation to avoid directory traversal
+    if segment.contains('/') || segment.contains('\\') || segment.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid segment path").into_response();
+    }
+
     if let Some(sess) = state.session_mgr.sessions().get(&id) {
-        let path = sess.dir.join(&segment);
-        if let Ok(file) = tokio::fs::File::open(&path).await {
-            use axum::body::Body;
-            use tokio_util::io::ReaderStream;
-            let stream = ReaderStream::new(file);
-            let body = Body::from_stream(stream);
-            sess.touch();
-            return (
-                StatusCode::OK,
-                [
-                    (
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("video/mp2t"),
-                    ),
-                    (
-                        axum::http::header::CACHE_CONTROL,
-                        axum::http::HeaderValue::from_static("no-store, max-age=0"),
-                    ),
-                    (
-                        axum::http::header::PRAGMA,
-                        axum::http::HeaderValue::from_static("no-cache"),
-                    ),
-                    (
-                        axum::http::header::EXPIRES,
-                        axum::http::HeaderValue::from_static("0"),
-                    ),
-                ],
-                body,
+        // Build a ServeDir rooted at the session directory and forward the request
+        // with the URI path rewritten to the file within that directory.
+        let req = Request::builder()
+            .uri(
+                Uri::builder()
+                    .path_and_query(format!("/{segment}"))
+                    .build()
+                    .unwrap(),
             )
-                .into_response();
-        }
+            .body(Body::empty())
+            .unwrap();
+        // Preserve method to allow HEAD
+        // Note: builder() defaults to GET; adjust if Original method is needed in future.
+        // ServeDir handles Range/ETag/etc.
+        let svc = ServeDir::new(&*sess.dir);
+        let mut resp = svc
+            .oneshot(req)
+            .await
+            .expect("ServeDir is infallible and should not error");
+        // Add conservative caching headers suitable for HLS segments
+        use axum::http::header as hh;
+        resp.headers_mut().insert(
+            hh::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store, max-age=0"),
+        );
+        resp.headers_mut()
+            .insert(hh::PRAGMA, axum::http::HeaderValue::from_static("no-cache"));
+        resp.headers_mut()
+            .insert(hh::EXPIRES, axum::http::HeaderValue::from_static("0"));
+        sess.touch();
+        return resp.into_response();
     }
     (StatusCode::NOT_FOUND, "Segment not found").into_response()
 }

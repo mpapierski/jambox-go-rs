@@ -30,9 +30,9 @@ pub struct Cli {
     #[arg(long, env = "JAMBOX_SESSION_IDLE_SECS", default_value_t = 180)]
     pub session_idle_secs: u64,
     /// Target HLS segment duration in seconds (env: JAMBOX_HLS_SEGMENT_DURATION)
-    #[arg(long, env = "JAMBOX_HLS_SEGMENT_DURATION", default_value_t = 4)]
+    #[arg(long, env = "JAMBOX_HLS_SEGMENT_DURATION", default_value_t = 2)]
     pub hls_segment_duration: u32,
     /// HLS playlist size (number of media segments retained) (env: JAMBOX_HLS_PLAYLIST_SIZE)
-    #[arg(long, env = "JAMBOX_HLS_PLAYLIST_SIZE", default_value_t = 6)]
+    #[arg(long, env = "JAMBOX_HLS_PLAYLIST_SIZE", default_value_t = 8)]
     pub hls_playlist_size: u32,
 }
