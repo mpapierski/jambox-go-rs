@@ -2,6 +2,7 @@ use anyhow::Result;
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use tokio::task::spawn_blocking;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 
@@ -24,6 +25,23 @@ pub struct NewChannel<'a> {
     pub url: &'a str,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewChannelOwned {
+    pub sgtid: i32,
+    pub name: String,
+    pub url: String,
+}
+
+impl<'a> From<NewChannel<'a>> for NewChannelOwned {
+    fn from(value: NewChannel<'a>) -> Self {
+        Self {
+            sgtid: value.sgtid,
+            name: value.name.to_string(),
+            url: value.url.to_string(),
+        }
+    }
+}
+
 pub fn init_pool(database_url: &str) -> Result<SqlitePool> {
     let manager = ConnectionManager::<SqliteConnection>::new(database_url);
     let pool = Pool::builder().build(manager)?;
@@ -35,7 +53,7 @@ pub fn init_pool(database_url: &str) -> Result<SqlitePool> {
     Ok(pool)
 }
 
-pub fn upsert_channels(conn: &mut SqliteConnection, channels: &[NewChannel]) -> Result<()> {
+fn upsert_channels_sync(conn: &mut SqliteConnection, channels: &[NewChannel]) -> Result<()> {
     use crate::schema::channels::dsl as ch;
     for c in channels {
         diesel::insert_into(ch::channels)
@@ -48,13 +66,13 @@ pub fn upsert_channels(conn: &mut SqliteConnection, channels: &[NewChannel]) -> 
     Ok(())
 }
 
-pub fn load_channels(conn: &mut SqliteConnection) -> Result<Vec<ChannelRow>> {
+fn load_channels_sync(conn: &mut SqliteConnection) -> Result<Vec<ChannelRow>> {
     use crate::schema::channels::dsl as ch;
     let rows = ch::channels.order(ch::id.asc()).load::<ChannelRow>(conn)?;
     Ok(rows)
 }
 
-pub fn channel_at(conn: &mut SqliteConnection, index: usize) -> Result<Option<ChannelRow>> {
+fn channel_at_sync(conn: &mut SqliteConnection, index: usize) -> Result<Option<ChannelRow>> {
     use crate::schema::channels::dsl as ch;
     let mut rows = ch::channels
         .order(ch::id.asc())
@@ -62,4 +80,41 @@ pub fn channel_at(conn: &mut SqliteConnection, index: usize) -> Result<Option<Ch
         .limit(1)
         .load::<ChannelRow>(conn)?;
     Ok(rows.pop())
+}
+
+// Async wrappers to avoid blocking the async runtime. These offload Diesel calls to a blocking thread.
+pub async fn load_channels(pool: SqlitePool) -> Result<Vec<ChannelRow>> {
+    spawn_blocking(move || {
+        let mut conn = pool.get()?;
+        load_channels_sync(&mut conn)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("JoinError: {e}"))?
+}
+
+pub async fn channel_at(pool: SqlitePool, index: usize) -> Result<Option<ChannelRow>> {
+    spawn_blocking(move || {
+        let mut conn = pool.get()?;
+        channel_at_sync(&mut conn, index)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("JoinError: {e}"))?
+}
+
+pub async fn upsert_channels(pool: SqlitePool, channels: Vec<NewChannelOwned>) -> Result<()> {
+    spawn_blocking(move || {
+        let mut conn = pool.get()?;
+        // Borrow from owned for Insertable API
+        let borrowed: Vec<NewChannel> = channels
+            .iter()
+            .map(|c| NewChannel {
+                sgtid: c.sgtid,
+                name: &c.name,
+                url: &c.url,
+            })
+            .collect();
+        upsert_channels_sync(&mut conn, &borrowed)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("JoinError: {e}"))?
 }

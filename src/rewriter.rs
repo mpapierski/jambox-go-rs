@@ -1,6 +1,8 @@
 use once_cell::sync::Lazy;
 use regex::Regex;
 use tracing::warn;
+static RE_KEY: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex"));
 
 pub fn rewrite_upstream_playlist_segments(text: &str, base_url_no_auth: &str) -> String {
     let parsed = reqwest::Url::parse(base_url_no_auth);
@@ -10,9 +12,7 @@ pub fn rewrite_upstream_playlist_segments(text: &str, base_url_no_auth: &str) ->
         warn!("No #EXT-X-KEY line found");
         return text.to_owned();
     };
-    static RE_KEY: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r#"URI=\"([^\"]+)\",IV=(0x[0-9a-fA-F]+)"#).expect("valid key regex")
-    });
+
     let Some(caps) = RE_KEY.captures(&lines[i]) else {
         warn!(
             "#EXT-X-KEY line did not match expected pattern: {}",

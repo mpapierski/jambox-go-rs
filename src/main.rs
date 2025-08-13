@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -26,12 +26,14 @@ async fn main() -> Result<()> {
         .init();
 
     // Resolve data directory
-    if let Err(e) = fs::create_dir_all(&cli.data_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&cli.data_dir).await {
         warn!("failed to create data dir {:?}: {}", cli.data_dir, e);
     }
     let cookie_path = cli.data_dir.join("cookie.json");
-    let mut cookies: Cookies = match fs::read_to_string(&cookie_path) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+    let mut cookies: Cookies = match tokio::fs::read_to_string(&cookie_path).await {
+        Ok(s) => tokio::task::spawn_blocking(move || serde_json::from_str(&s).unwrap_or_default())
+            .await
+            .unwrap_or_default(),
         Err(_) => Cookies::default(),
     };
     if cookies.id.is_empty()
@@ -67,10 +69,9 @@ async fn main() -> Result<()> {
     // Init sqlite (file jambox.db) and load channels from DB; if empty generate from assets
     let db_path = cli.data_dir.join("jambox.db");
     let db_pool = db::init_pool(db_path.to_string_lossy().as_ref())?;
-    let mut conn = db_pool.get()?;
     let metrics = Arc::new(Metrics::new());
-    if db::load_channels(&mut conn)?.is_empty() {
-        if let Err(e) = ensure_channels_db(&cookies, &mut conn, &metrics).await {
+    if db::load_channels(db_pool.clone()).await?.is_empty() {
+        if let Err(e) = ensure_channels_db_async(&cookies, db_pool.clone(), &metrics).await {
             warn!("channel load failed: {}", e);
         }
     }
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
         .stream_dir
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("jambox_streams"));
-    if let Err(e) = fs::create_dir_all(&stream_root) {
+    if let Err(e) = tokio::fs::create_dir_all(&stream_root).await {
         warn!(error=%e, ?stream_root, "Failed to create stream dir");
     }
 
@@ -200,9 +201,10 @@ async fn main() -> Result<()> {
         .await?;
     Ok(())
 }
-async fn ensure_channels_db(
+
+async fn ensure_channels_db_async(
     cookies: &Cookies,
-    conn: &mut diesel::SqliteConnection,
+    pool: db::SqlitePool,
     metrics: &Metrics,
 ) -> Result<()> {
     if cookies.id.is_empty()
@@ -218,7 +220,7 @@ async fn ensure_channels_db(
     }
     let client = Client::builder().gzip(true).deflate(true).build()?;
     let assets = upstream::fetch_assets(&client, cookies, metrics).await?;
-    let mut rows: Vec<db::NewChannel> = Vec::new();
+    let mut rows: Vec<db::NewChannelOwned> = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
     for item in assets.0.iter() {
         let name = item.name.as_str();
@@ -232,18 +234,19 @@ async fn ensure_channels_db(
         }) = item.url.as_ref()
         {
             if !hls_aac.is_empty() {
-                rows.push(db::NewChannel {
+                rows.push(db::NewChannelOwned {
                     sgtid: sgtid as i32,
-                    name,
-                    url: hls_aac,
+                    name: name.to_string(),
+                    url: hls_aac.to_string(),
                 });
                 seen.insert(sgtid);
             }
         }
     }
     if !rows.is_empty() {
-        db::upsert_channels(conn, &rows)?;
-        info!(count = rows.len(), "Inserted/updated channels in DB");
+        let count = rows.len();
+        db::upsert_channels(pool, rows).await?;
+        info!(count, "Inserted/updated channels in DB");
     }
     Ok(())
 }

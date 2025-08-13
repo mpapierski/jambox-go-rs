@@ -5,7 +5,7 @@ use axum::{
     routing::get,
     Router,
 };
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{debug, info, warn};
 
@@ -65,11 +65,7 @@ async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn get_playlist(State(state): State<AppState>) -> impl IntoResponse {
-    let mut conn = match state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
-    };
-    let rows = match db::load_channels(&mut conn) {
+    let rows = match db::load_channels(state.db_pool.clone()).await {
         Ok(r) => r,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB query error").into_response(),
     };
@@ -110,16 +106,14 @@ async fn get_tvg_logo(
     PathParam(id): PathParam<usize>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let mut conn = match state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
-    };
-    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    let row = db::channel_at(state.db_pool.clone(), id)
+        .await
+        .unwrap_or_default();
     if let Some(ch) = row.as_ref() {
         let cache_dir = state.data_dir.join("logos");
-        let _ = fs::create_dir_all(&cache_dir);
+        let _ = tokio::fs::create_dir_all(&cache_dir).await;
         let path = cache_dir.join(format!("{}.png", ch.sgtid));
-        let fetch_needed = match fs::metadata(&path) {
+        let fetch_needed = match tokio::fs::metadata(&path).await {
             Ok(meta) => meta.len() == 0,
             Err(_) => true,
         };
@@ -128,7 +122,7 @@ async fn get_tvg_logo(
             match state.client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(bytes) = resp.bytes().await {
-                        let _ = fs::write(&path, &bytes);
+                        let _ = tokio::fs::write(&path, &bytes).await;
                     }
                 }
                 _ => {}
@@ -246,11 +240,9 @@ async fn channel_playlist(
     State(state): State<AppState>,
     PathParam(id): PathParam<usize>,
 ) -> impl IntoResponse {
-    let mut conn = match state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
-    };
-    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    let row = db::channel_at(state.db_pool.clone(), id)
+        .await
+        .unwrap_or_default();
     let Some(ch) = row else {
         return (StatusCode::NOT_FOUND, "Channel not found").into_response();
     };
@@ -270,7 +262,7 @@ async fn channel_playlist(
         Some(sess) => {
             sess.touch();
             let playlist_path = sess.dir.join("out.m3u8");
-            match fs::read_to_string(&playlist_path) {
+            match tokio::fs::read_to_string(&playlist_path).await {
                 Ok(text) => {
                     let rewritten = rewriter::rewrite_playlist_urls(&text, id);
                     (
@@ -356,11 +348,9 @@ async fn channel_upstream_playlist(
     State(state): State<AppState>,
     PathParam(id): PathParam<usize>,
 ) -> impl IntoResponse {
-    let mut conn = match state.db_pool.get() {
-        Ok(c) => c,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "DB pool error").into_response(),
-    };
-    let row = db::channel_at(&mut conn, id).unwrap_or_default();
+    let row = db::channel_at(state.db_pool.clone(), id)
+        .await
+        .unwrap_or_default();
     let Some(ch) = row else {
         return (StatusCode::NOT_FOUND, "Channel not found").into_response();
     };
