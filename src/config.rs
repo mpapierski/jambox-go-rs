@@ -35,4 +35,7 @@ pub struct Cli {
     /// HLS playlist size (number of media segments retained) (env: JAMBOX_HLS_PLAYLIST_SIZE)
     #[arg(long, env = "JAMBOX_HLS_PLAYLIST_SIZE", default_value_t = 8)]
     pub hls_playlist_size: u32,
+    /// Enable transcoding to H.264 with keyframe-aligned GOPs (env: JAMBOX_TRANSCODE)
+    #[arg(long, env = "JAMBOX_TRANSCODE", default_value_t = false)]
+    pub transcode: bool,
 }

@@ -55,10 +55,33 @@ pub fn rewrite_upstream_playlist_segments(text: &str, base_url_no_auth: &str) ->
 pub fn rewrite_playlist_urls(text: &str, id: usize) -> String {
     let base = format!("/channel/{id}/");
     let mut out = String::with_capacity(text.len());
+    // Handle both MPEG-TS and fMP4 HLS playlists
     for line in text.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
+        if line.starts_with("#EXT-X-MAP:") {
+            // Rewrite initialization segment URI
+            // Typical: #EXT-X-MAP:URI="init.mp4"
+            if let Some(start) = line.find("URI=") {
+                let mut rewritten = String::with_capacity(line.len() + base.len());
+                // Copy up to URI=
+                rewritten.push_str(&line[..start + 5]); // include URI="
+                                                        // Decide quote char
+                let quote = line.chars().nth(start + 4).unwrap_or('"');
+                if let Some(after) = line[(start + 5)..].find(quote) {
+                    rewritten.push_str(&base);
+                    rewritten.push_str(&line[(start + 5)..(start + 5 + after)]);
+                    rewritten.push(quote);
+                    rewritten.push_str(&line[(start + 5 + after + 1)..]);
+                    out.push_str(&rewritten);
+                } else {
+                    // Fallback, keep line as-is
+                    out.push_str(line);
+                }
+            } else {
+                out.push_str(line);
+            }
+        } else if line.starts_with('#') || line.trim().is_empty() {
             out.push_str(line);
-        } else if line.ends_with(".ts") {
+        } else if line.ends_with(".ts") || line.ends_with(".m4s") || line.ends_with(".mp4") {
             out.push_str(&base);
             out.push_str(line);
         } else {

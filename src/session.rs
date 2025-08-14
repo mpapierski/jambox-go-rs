@@ -66,6 +66,7 @@ pub struct SessionManager {
     hls_segment_duration: u32,
     hls_playlist_size: u32,
     metrics: Arc<Metrics>,
+    transcode: bool,
 }
 
 impl SessionManager {
@@ -83,9 +84,14 @@ impl SessionManager {
             hls_segment_duration,
             hls_playlist_size,
             metrics,
+            transcode: true, // default; caller can override via setter if needed
         }
     }
 
+    pub fn with_transcode(mut self, transcode: bool) -> Self {
+        self.transcode = transcode;
+        self
+    }
     pub fn sessions(&self) -> &DashMap<usize, FfmpegSession> {
         &self.sessions
     }
@@ -166,6 +172,7 @@ impl SessionManager {
             id,
             self.hls_segment_duration,
             self.hls_playlist_size,
+            self.transcode,
         )
         .await?;
         if let Some(stderr) = child.stderr.take() {
@@ -269,7 +276,23 @@ impl SessionManager {
                     let Some(event) = maybe_event else { return Err(anyhow!("watcher closed before playlist creation: {}", output.display())); };
                     let is_relevant_kind = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
                     debug!(session_id=%id, ?event, "Received file system event: {:?}", event);
-                    if is_relevant_kind && event.paths.iter().any(|p| p.file_name().map(|n| n == output.file_name().unwrap()).unwrap_or(false)) { break; }
+                    if is_relevant_kind && event.paths.iter().any(|p| p.file_name().map(|n| n == output.file_name().unwrap()).unwrap_or(false)) {
+                        // Check readiness: playlist contains MAP and at least one segment; files exist and non-empty
+                        if let Ok(text) = tokio::fs::read_to_string(&output).await {
+                            let has_map = text.lines().any(|l| l.starts_with("#EXT-X-MAP:"));
+                            let mut first_seg: Option<String> = None;
+                            for l in text.lines() {
+                                if !(l.starts_with('#') || l.trim().is_empty()) && (l.ends_with(".m4s") || l.ends_with(".mp4") || l.ends_with(".ts")) {
+                                    first_seg = Some(l.trim().to_string());
+                                    break;
+                                }
+                            }
+                            let init_ok = tokio::fs::metadata(dir.join("init.mp4")).await.map(|m| m.len() > 0).unwrap_or(false);
+                            let seg_ok = if let Some(seg) = &first_seg { tokio::fs::metadata(dir.join(seg)).await.map(|m| m.len() > 0).unwrap_or(false) } else { false };
+                            if has_map && init_ok && first_seg.is_some() && seg_ok { break; }
+                        }
+                        // Not ready yet; keep waiting for more events until timeout
+                    }
                 }
             }
         }
@@ -293,6 +316,7 @@ pub async fn launch_ffmpeg_child(
     id: usize,
     seg_duration: u32,
     playlist_size: u32,
+    transcode: bool,
 ) -> Result<tokio::process::Child> {
     let output = dir.join("out.m3u8");
     let mut cmd = Command::new("ffmpeg");
@@ -302,6 +326,10 @@ pub async fn launch_ffmpeg_child(
         .args(["-reconnect_streamed", "1"])
         .args(["-reconnect_on_network_error", "1"])
         .args(["-reconnect_delay_max", "2"])
+        // Help stabilize timestamps from flaky inputs
+        .args(["-fflags", "+genpts"]) // generate missing PTS to keep monotonic order
+        .args(["-fflags", "+discardcorrupt"]) // drop corrupt packets instead of passing bad DTS
+        .args(["-avoid_negative_ts", "make_zero"]) // shift to non-negative timeline
         .args(["-allowed_extensions", "ALL"])
         .args(["-i", upstream_url])
         // Input audio is in AAC codec but in ADTS format, but fMp4 expects "AudioSpecificConfig" headers instead, not ADTS frames with syncwords.
@@ -312,14 +340,43 @@ pub async fn launch_ffmpeg_child(
         .args([
             "-hls_segment_filename",
             &dir.join("seg_%05d.m4s").to_string_lossy(),
-        ])
-        .args(["-c", "copy"])
+        ]);
+
+    if transcode {
+        cmd
+            // Transcode video to keyframe-aligned GOPs for robust playback; keep audio copy
+            .args(["-c:v", "libx264"]) // re-encode video to H.264
+            .args(["-preset", "veryfast"]) // low-latency friendly preset
+            .args(["-tune", "zerolatency"]) // cut buffering in encoder
+            .args([
+                "-x264-params",
+                &format!(
+                    "scenecut=0:open_gop=0:keyint={}:min-keyint={}",
+                    seg_duration * 60,
+                    seg_duration * 60
+                ),
+            ])
+            .args(["-g", &format!("{}", seg_duration * 60)]) // large enough to avoid extra keyframes within segment
+            .args(["-profile:v", "main"]) // VLC-friendly
+            .args(["-level:v", "4.0"]) // safe level
+            .args(["-pix_fmt", "yuv420p"]) // compatibility
+            .args([
+                "-force_key_frames",
+                &format!("expr:gte(t,n_forced*{seg_duration})"),
+            ]) // IDR at segment boundaries
+            .args(["-c:a", "copy"]); // keep audio as-is
+    } else {
+        cmd.args(["-c", "copy"]);
+    }
+    cmd
         .args(["-f", "hls"])
         .args(["-hls_time", &seg_duration.to_string()])
         .args(["-hls_list_size", &playlist_size.to_string()])
+        .args(["-hls_init_time", &seg_duration.to_string()]) // help align first segment
+        // Favor live-safe updates and independent segments; cut only on keyframes
         .args([
             "-hls_flags",
-            "delete_segments+program_date_time+independent_segments",
+            "append_list+omit_endlist+delete_segments+program_date_time+independent_segments+temp_file",
         ])
         .args(["-hls_delete_threshold", "1"])
         .arg("-nostats")

@@ -341,6 +341,12 @@ async fn channel_segment(
             .oneshot(req)
             .await
             .expect("ServeDir is infallible and should not error");
+        info!(
+            session_id = %id,
+            segment = %segment,
+            status = %resp.status(),
+            "Serving segment",
+        );
         // Add conservative caching headers suitable for HLS segments
         use axum::http::header as hh;
         resp.headers_mut().insert(
