@@ -322,7 +322,7 @@ pub async fn launch_ffmpeg_child(
         .arg("-hls_list_size")
         .arg(playlist_size.to_string())
         .arg("-hls_flags")
-        .arg("delete_segments+program_date_time+independent_segments")
+        .arg("delete_segments+program_date_time+independent_segments+temp_file")
         .arg("-hls_delete_threshold")
         .arg("1")
         .arg("-nostats")
