@@ -67,6 +67,7 @@ pub struct SessionManager {
     hls_playlist_size: u32,
     metrics: Arc<Metrics>,
     transcode: bool,
+    fmp4: bool,
 }
 
 impl SessionManager {
@@ -85,11 +86,17 @@ impl SessionManager {
             hls_playlist_size,
             metrics,
             transcode: true, // default; caller can override via setter if needed
+            fmp4: false,
         }
     }
 
     pub fn with_transcode(mut self, transcode: bool) -> Self {
         self.transcode = transcode;
+        self
+    }
+
+    pub fn with_fmp4(mut self, fmp4: bool) -> Self {
+        self.fmp4 = fmp4;
         self
     }
     pub fn sessions(&self) -> &DashMap<usize, FfmpegSession> {
@@ -173,6 +180,7 @@ impl SessionManager {
             self.hls_segment_duration,
             self.hls_playlist_size,
             self.transcode,
+            self.fmp4,
         )
         .await?;
         if let Some(stderr) = child.stderr.take() {
@@ -279,17 +287,19 @@ impl SessionManager {
                     if is_relevant_kind && event.paths.iter().any(|p| p.file_name().map(|n| n == output.file_name().unwrap()).unwrap_or(false)) {
                         // Check readiness: playlist contains MAP and at least one segment; files exist and non-empty
                         if let Ok(text) = tokio::fs::read_to_string(&output).await {
-                            let has_map = text.lines().any(|l| l.starts_with("#EXT-X-MAP:"));
                             let mut first_seg: Option<String> = None;
+                            let mut has_map = false;
                             for l in text.lines() {
+                                if l.starts_with("#EXT-X-MAP:") { has_map = true; }
                                 if !(l.starts_with('#') || l.trim().is_empty()) && (l.ends_with(".m4s") || l.ends_with(".mp4") || l.ends_with(".ts")) {
                                     first_seg = Some(l.trim().to_string());
                                     break;
                                 }
                             }
-                            let init_ok = tokio::fs::metadata(dir.join("init.mp4")).await.map(|m| m.len() > 0).unwrap_or(false);
+                            let init_ok = if self.fmp4 { tokio::fs::metadata(dir.join("init.mp4")).await.map(|m| m.len() > 0).unwrap_or(false) } else { true };
                             let seg_ok = if let Some(seg) = &first_seg { tokio::fs::metadata(dir.join(seg)).await.map(|m| m.len() > 0).unwrap_or(false) } else { false };
-                            if has_map && init_ok && first_seg.is_some() && seg_ok { break; }
+                            let ready = if self.fmp4 { has_map && init_ok && seg_ok } else { seg_ok };
+                            if ready { break; }
                         }
                         // Not ready yet; keep waiting for more events until timeout
                     }
@@ -317,6 +327,7 @@ pub async fn launch_ffmpeg_child(
     seg_duration: u32,
     playlist_size: u32,
     transcode: bool,
+    fmp4: bool,
 ) -> Result<tokio::process::Child> {
     let output = dir.join("out.m3u8");
     let mut cmd = Command::new("ffmpeg");
@@ -327,20 +338,34 @@ pub async fn launch_ffmpeg_child(
         .args(["-reconnect_on_network_error", "1"])
         .args(["-reconnect_delay_max", "2"])
         // Help stabilize timestamps from flaky inputs
-        .args(["-fflags", "+genpts"]) // generate missing PTS to keep monotonic order
-        .args(["-fflags", "+discardcorrupt"]) // drop corrupt packets instead of passing bad DTS
+        .args(["-fflags", "+genpts+discardcorrupt+igndts"]) // generate PTS, drop corrupt, ignore broken DTS
         .args(["-avoid_negative_ts", "make_zero"]) // shift to non-negative timeline
         .args(["-allowed_extensions", "ALL"])
-        .args(["-i", upstream_url])
-        // Input audio is in AAC codec but in ADTS format, but fMp4 expects "AudioSpecificConfig" headers instead, not ADTS frames with syncwords.
-        .args(["-bsf:a", "aac_adtstoasc"])
-        // Use MP4/fMP4 container
-        .args(["-hls_segment_type", "fmp4"])
-        .args(["-hls_fmp4_init_filename", "init.mp4"])
-        .args([
-            "-hls_segment_filename",
-            &dir.join("seg_%05d.m4s").to_string_lossy(),
-        ]);
+        .args(["-i", upstream_url]);
+    // Apply ADTS->ASC only for fMP4 outputs; TS should keep ADTS
+    if fmp4 {
+        cmd.args(["-bsf:a", "aac_adtstoasc"]);
+    };
+
+    if fmp4 {
+        cmd
+            // Use MP4/fMP4 container
+            .args(["-hls_segment_type", "fmp4"])
+            .args(["-hls_fmp4_init_filename", "init.mp4"])
+            .args([
+                "-hls_segment_filename",
+                &dir.join("seg_%05d.m4s").to_string_lossy(),
+            ]);
+    } else {
+        cmd.args(["-hls_segment_type", "mpegts"]) // explicit TS format
+            .args([
+                "-hls_segment_filename",
+                &dir.join("seg_%05d.ts").to_string_lossy(),
+            ])
+            // Improve TS resilience and timing: resend headers and frequent PCRs
+            .args(["-mpegts_flags", "resend_headers+pat_pmt_at_frames"])
+            .args(["-flush_packets", "1"]);
+    }
 
     if transcode {
         cmd
@@ -368,22 +393,29 @@ pub async fn launch_ffmpeg_child(
     } else {
         cmd.args(["-c", "copy"]);
     }
-    cmd
-        .args(["-f", "hls"])
+    cmd.args(["-f", "hls"])
         .args(["-hls_time", &seg_duration.to_string()])
-        .args(["-hls_list_size", &playlist_size.to_string()])
-        .args(["-hls_init_time", &seg_duration.to_string()]) // help align first segment
-        // Favor live-safe updates and independent segments; cut only on keyframes
-        .args([
-            "-hls_flags",
-            "append_list+omit_endlist+delete_segments+program_date_time+independent_segments+temp_file",
-        ])
-        .args(["-hls_delete_threshold", "1"])
-        .arg("-nostats")
-        .args(["-loglevel", "warning"])
-        .args(["-progress"])
-        .args(["pipe:1"])
-        .arg(output.to_string_lossy().to_string());
+        .args(["-hls_list_size", &playlist_size.to_string()]);
+    if fmp4 {
+        cmd.args(["-hls_init_time", &seg_duration.to_string()]);
+    } else {
+        cmd.args(["-hls_init_time", "0"]);
+    }
+    // Favor live-safe updates and independent segments; temp_file avoids partial reads; signal initial discontinuity
+    cmd.args([
+        "-hls_flags",
+        "append_list+omit_endlist+delete_segments+program_date_time+independent_segments+temp_file+discont_start",
+    ])
+    // Keep muxing latency minimal to avoid late PCR perception in players
+    .args(["-muxdelay", "0"])
+    .args(["-muxpreload", "0"])
+    .args(["-max_interleave_delta", "0"])
+    .args(["-hls_delete_threshold", "1"])
+    .arg("-nostats")
+    .args(["-loglevel", "info"])
+    .args(["-progress"])
+    .args(["pipe:1"])
+    .arg(output.to_string_lossy().to_string());
     cmd.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

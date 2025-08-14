@@ -38,4 +38,7 @@ pub struct Cli {
     /// Enable transcoding to H.264 with keyframe-aligned GOPs (env: JAMBOX_TRANSCODE)
     #[arg(long, env = "JAMBOX_TRANSCODE", default_value_t = false)]
     pub transcode: bool,
+    /// Serve fMP4 HLS instead of MPEG-TS (env: JAMBOX_FMP4)
+    #[arg(long, env = "JAMBOX_FMP4", default_value_t = false)]
+    pub fmp4: bool,
 }

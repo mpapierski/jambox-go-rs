@@ -118,7 +118,8 @@ async fn main() -> Result<()> {
         cli.hls_playlist_size,
         metrics.clone(),
     )
-    .with_transcode(cli.transcode);
+    .with_transcode(cli.transcode)
+    .with_fmp4(cli.fmp4);
     session_mgr.spawn_gc();
     let state = AppState {
         client: http_client,
